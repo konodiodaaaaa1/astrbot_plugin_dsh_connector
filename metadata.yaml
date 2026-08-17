@@ -1,0 +1,21 @@
+name: astrbot_plugin_dsh_bridge
+display_name: DeepSeek Harness Connector
+short_desc: 在 AstrBot 中连接、控制并呈现 DeepSeek Harness 会话
+desc: >-
+  将 AstrBot 与 DeepSeek Harness（DSH）桌面客户端连接起来，实现两个平台的桥接。
+  用户在聊天中发送 /dsh <指令>（例如：/dsh 帮我写一段 Python 代码），插件会通过
+  DSH 客户端的本地 HTTP API 或 dsh 命令行执行该指令，并把回复回传到聊天中。
+  主要面向官方 QQ 机器人（qq_official），同时兼容其它平台。
+version: 1.1.0
+author: konodiodaaaaa1
+repo: https://github.com/konodiodaaaaa1/astrbot_plugin_dsh_connector
+astrbot_version: ">=4.0.0"
+support_platforms:
+  - qq_official
+  - aiocqhttp
+tags:
+  - deepseek
+  - harness
+  - dsh
+  - bridge
+  - connector

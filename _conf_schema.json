@@ -1,0 +1,23 @@
+{
+  "mode": {"description": "连接方式", "type": "string", "default": "http", "options": ["http", "headless", "auto"], "hint": "http：连接 DSH Web API；headless：调用 dsh 命令行；auto：HTTP 不可用时运行命令行"},
+  "http_base_url": {"description": "DSH Web API 地址", "type": "string", "default": "http://127.0.0.1:3080", "hint": "对应 dsh web --port 3080 的地址"},
+  "command_timeout": {"description": "单次任务超时（秒）", "type": "int", "default": 600},
+  "poll_interval": {"description": "HTTP 轮询间隔（秒）", "type": "float", "default": 1.0},
+  "persistent_session": {"description": "每个聊天保持独立 DSH 会话", "type": "bool", "default": true, "hint": "关闭后每次 /dsh 都创建新会话"},
+  "default_working_directory": {"description": "新会话默认工作目录", "type": "string", "default": "", "hint": "留空时使用 DSH 主机默认工作目录"},
+  "default_agent_preset": {"description": "新会话默认 Agent 预设", "type": "string", "default": "", "hint": "留空时使用 DSH 默认预设；可用 /dsh preset 为单个聊天覆盖"},
+  "default_provider": {"description": "新会话默认模型服务商", "type": "string", "default": "", "hint": "需与 default_model 同时填写；可用 /dsh model 查询"},
+  "default_model": {"description": "新会话默认模型", "type": "string", "default": "", "hint": "例如 deepseek-v4-pro"},
+  "default_reasoning_effort": {"description": "新会话默认推理强度", "type": "string", "default": "", "hint": "留空时使用 DSH 默认；可用 /dsh model 查询支持值"},
+  "default_permission_preset": {"description": "新会话默认权限预设", "type": "string", "default": "", "hint": "例如 read-only、workspace-write、danger-full-access"},
+  "enable_llm_tools": {"description": "启用 LLM 调用 DSH 工具", "type": "bool", "default": false, "hint": "开启后 AstrBot 的 LLM 可查询、创建和控制 DSH 会话"},
+  "max_reply_chars": {"description": "文本回复最大字符数（0 表示不限制）", "type": "int", "default": 4000},
+  "reply_chunk_size": {"description": "文本回复分片大小（0 表示不分片）", "type": "int", "default": 2000},
+  "max_images_per_reply": {"description": "每次回复最多渲染图片数", "type": "int", "default": 4},
+  "max_image_bytes": {"description": "单张远程或 data URL 图片最大字节数", "type": "int", "default": 5242880},
+  "image_download_timeout": {"description": "图片下载超时（秒）", "type": "int", "default": 20},
+  "allow_remote_images": {"description": "渲染 DSH 输出中的 HTTP(S) 图片", "type": "bool", "default": true},
+  "dsh_command": {"description": "dsh 可执行文件路径或命令名", "type": "string", "default": "dsh", "hint": "headless 模式使用"},
+  "dsh_profile": {"description": "dsh 启动 profile", "type": "string", "default": "headless"},
+  "dsh_extra_args": {"description": "传给 dsh 的额外命令行参数", "type": "string", "default": ""}
+}
