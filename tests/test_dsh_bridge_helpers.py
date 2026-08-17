@@ -32,5 +32,26 @@ class DshBridgeHelperTests(unittest.TestCase):
         self.assertEqual(rows, [{"provider": "deepseek", "provider_name": "DeepSeek", "model": "v4", "name": "v4", "efforts": ["low", "high"]}])
 
 
+class DshBridgeImageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_data_url_becomes_an_astrbot_image_component(self):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = {"max_reply_chars": 4000, "max_images_per_reply": 4, "max_image_bytes": 1024}
+        plugin._temp_media = set()
+        chain = await plugin._reply_chain(assistant_reply({
+            "data": {"message": {"content": [
+                {"type": "text", "text": "render this"},
+                {"type": "image", "url": "data:image/png;base64,iVBORw0KGgo="},
+            ]}}
+        }))
+        self.assertEqual(chain[0].text, "render this")
+        self.assertEqual(len(chain), 2)
+        image_path = Path(chain[1].file)
+        self.assertTrue(image_path.is_file())
+        for path in plugin._temp_media:
+            path.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     unittest.main()
