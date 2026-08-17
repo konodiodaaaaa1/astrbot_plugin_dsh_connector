@@ -11,6 +11,7 @@
   "default_reasoning_effort": {"description": "新会话默认推理强度", "type": "string", "default": "", "hint": "留空时使用 DSH 默认；可用 /dsh model 查询支持值"},
   "default_permission_preset": {"description": "新会话默认权限预设", "type": "string", "default": "", "hint": "例如 read-only、workspace-write、danger-full-access"},
   "enable_llm_tools": {"description": "启用 LLM 调用 DSH 工具", "type": "bool", "default": false, "hint": "开启后 AstrBot 的 LLM 可查询、创建和控制 DSH 会话"},
+  "enable_llm_mutation_tools": {"description": "允许 LLM 修改 DSH 设置", "type": "bool", "default": false, "hint": "仅在 enable_llm_tools=true 时生效；开启后 LLM 可经 settings.mutate 更新 DSH 配置"},
   "max_reply_chars": {"description": "文本回复最大字符数（0 表示不限制）", "type": "int", "default": 4000},
   "reply_chunk_size": {"description": "文本回复分片大小（0 表示不分片）", "type": "int", "default": 2000},
   "max_images_per_reply": {"description": "每次回复最多渲染图片数", "type": "int", "default": 4},

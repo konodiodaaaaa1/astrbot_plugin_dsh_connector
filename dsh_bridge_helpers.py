@@ -108,6 +108,10 @@ def _collect_image_sources(value: Any, images: list[str], image_hint: bool = Fal
         return
     if not isinstance(value, dict):
         return
+    attachment_id = value.get("attachmentId")
+    if isinstance(attachment_id, str) and attachment_id.strip():
+        _append_unique(images, f"dsh-attachment:{attachment_id.strip()}")
+        return
     for key, item in value.items():
         if key == "type":
             continue
