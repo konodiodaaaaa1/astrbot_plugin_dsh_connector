@@ -8,6 +8,7 @@ from core.config_service import dotted_path, namespace_map, parse_json_value, re
 from core.dsh_client import DshHttpClient, normalize_client_time_zone
 from core.session_options import SessionSetupWizard, format_session_options, normalize_session_options
 from core.session_state import SessionState
+from core.reply_render import should_render_card, split_markdown_for_cards
 from dsh_connector_helpers import DshReply, assistant_reply, merge_replies, model_rows
 
 
@@ -92,6 +93,14 @@ class DshConnectorHelperTests(unittest.TestCase):
     def test_explicit_iana_timezone_is_preserved(self):
         self.assertEqual(normalize_client_time_zone("Asia/Shanghai"), "Asia/Shanghai")
         self.assertEqual(normalize_client_time_zone("UTC"), "UTC")
+
+    def test_card_split_preserves_fenced_code_blocks(self):
+        markdown = "# Result\n\n```python\n" + "print('line')\n" * 160 + "```\n"
+        cards = split_markdown_for_cards(markdown, 600)
+        self.assertGreater(len(cards), 1)
+        self.assertTrue(all(card.count("```") % 2 == 0 for card in cards))
+        self.assertTrue(should_render_card("auto", "```python\nprint('ok')\n```", 120))
+        self.assertFalse(should_render_card("text", markdown, 1))
 
 
 class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
@@ -186,6 +195,36 @@ class DshSessionStateTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DshConnectorImageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_card_mode_uses_astrbot_t2i_and_keeps_image_component(self):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = {"reply_render_mode": "card", "card_max_chars": 6000}
+        rendered = []
+
+        async def text_to_image(markdown):
+            rendered.append(markdown)
+            return "https://example.test/dsh-card.png"
+
+        plugin.text_to_image = text_to_image
+        components = await plugin._render_reply_text("```python\nprint('ok')\n```")
+        self.assertEqual(rendered, ["```python\nprint('ok')\n```"])
+        self.assertEqual(len(components), 1)
+        self.assertEqual(components[0].file, "https://example.test/dsh-card.png")
+
+    async def test_card_mode_falls_back_to_plain_text_when_t2i_fails(self):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = {"reply_render_mode": "card"}
+
+        async def text_to_image(_markdown):
+            raise RuntimeError("renderer unavailable")
+
+        plugin.text_to_image = text_to_image
+        components = await plugin._render_reply_text("# fallback")
+        self.assertEqual(components[0].text, "# fallback")
+
     async def test_data_url_becomes_an_astrbot_image_component(self):
         from main import Main
 

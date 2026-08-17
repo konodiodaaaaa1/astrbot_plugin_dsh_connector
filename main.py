@@ -50,6 +50,7 @@ try:
     from .core.session_options import (
         SessionSetupWizard, format_session_options, normalize_session_options, resolve_option_field,
     )
+    from .core.reply_render import normalize_reply_render_mode, should_render_card, split_markdown_for_cards
 except ImportError:  # AstrBot also supports loading a plugin main.py as a module.
     from dsh_connector_helpers import DshReply, merge_replies, model_rows
     from core.dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout, normalize_client_time_zone
@@ -57,6 +58,7 @@ except ImportError:  # AstrBot also supports loading a plugin main.py as a modul
     from core.presentation import current_goal, projection_values, session_label
     from core.session_state import SessionState
     from core.session_options import SessionSetupWizard, format_session_options, normalize_session_options, resolve_option_field
+    from core.reply_render import normalize_reply_render_mode, should_render_card, split_markdown_for_cards
 
 HELP_TEXT = """【DeepSeek Harness Connector】
 用法：
@@ -336,11 +338,39 @@ class Main(Star):
         self._temp_media.add(path)
         return str(path)
 
+    async def _render_reply_text(self, text: str) -> list:
+        """Render DSH Markdown through AstrBot t2i, with a plain-text fallback."""
+        mode = normalize_reply_render_mode(self._cfg("reply_render_mode", "text"))
+        try:
+            minimum = max(1, int(self._cfg("card_min_chars", 120)))
+            maximum = max(500, int(self._cfg("card_max_chars", 6000)))
+        except (TypeError, ValueError):
+            minimum, maximum = 120, 6000
+        if not should_render_card(mode, text, minimum):
+            return [Plain(text)]
+
+        rendered: list[Image] = []
+        try:
+            for card_markdown in split_markdown_for_cards(text, maximum):
+                image_ref = await self.text_to_image(card_markdown)
+                if not image_ref:
+                    raise RuntimeError("AstrBot t2i did not return an image")
+                image_ref = str(image_ref)
+                rendered.append(
+                    Image.fromURL(image_ref)
+                    if image_ref.startswith(("http://", "https://"))
+                    else Image.fromFileSystem(image_ref)
+                )
+        except Exception as exc:
+            logger.warning("DSH reply card rendering failed; falling back to text: %s", exc)
+            return [Plain(text)]
+        return rendered or [Plain(text)]
+
     async def _reply_chain(self, reply: DshReply) -> list:
         components = []
         text = self._truncate(reply.text)
         if text:
-            components.append(Plain(text))
+            components.extend(await self._render_reply_text(text))
         maximum = max(0, int(self._cfg("max_images_per_reply", 4)))
         for source in reply.image_sources[:maximum]:
             image_path = await self._download_image(source)

@@ -3,8 +3,10 @@
 from .dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout
 from .session_state import SessionState
 from .session_options import SessionSetupWizard, default_session_options, format_session_options
+from .reply_render import normalize_reply_render_mode, should_render_card, split_markdown_for_cards
 
 __all__ = [
     "DshConnectionError", "DshError", "DshHttpClient", "DshTimeout",
     "SessionState", "SessionSetupWizard", "default_session_options", "format_session_options",
+    "normalize_reply_render_mode", "should_render_card", "split_markdown_for_cards",
 ]

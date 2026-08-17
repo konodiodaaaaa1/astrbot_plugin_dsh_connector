@@ -112,6 +112,16 @@ dsh web --port 3080
 
 下载大小、数量和超时由插件配置页中的图片参数控制。连接器卸载时会清理其创建的临时图片。
 
+## Markdown 卡片
+
+插件配置中的 `reply_render_mode` 控制 DSH 文本输出：
+
+- `text` 保持普通文本回复
+- `auto` 在代码块、表格、标题、引用、公式、图片 Markdown 或较长内容时输出图片卡
+- `card` 将所有 DSH 文本经 AstrBot t2i 渲染为图片卡
+
+卡片使用 AstrBot 当前配置的 t2i 模板和端点，因此复用已有的 Markdown、Shiki 代码高亮与 KaTeX 公式渲染能力。`card_max_chars` 会对长回复分卡，保留每段代码围栏；t2i 不可用时自动发送原始文本。DSH 原生图片和 attachment 保持独立图片消息输出。
+
 ## LLM 工具
 
 `enable_llm_tools` 开启后注册 `dsh_connector_*` 工具，覆盖状态、会话、模型、配置发现、Skills、Subagents、Goals 和 Workspaces。
