@@ -5,9 +5,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.config_service import dotted_path, namespace_map, parse_json_value, read_path
-from core.dsh_client import DshHttpClient
+from core.dsh_client import DshHttpClient, normalize_client_time_zone
+from core.session_options import SessionSetupWizard, format_session_options, normalize_session_options
 from core.session_state import SessionState
-from dsh_bridge_helpers import DshReply, assistant_reply, merge_replies, model_rows
+from dsh_connector_helpers import DshReply, assistant_reply, merge_replies, model_rows
 
 
 class CaptureClient(DshHttpClient):
@@ -20,7 +21,7 @@ class CaptureClient(DshHttpClient):
         return {"accepted": True, "sessionId": "child", "revision": 3}
 
 
-class DshBridgeHelperTests(unittest.TestCase):
+class DshConnectorHelperTests(unittest.TestCase):
     def test_assistant_reply_keeps_text_and_distinct_images(self):
         reply = assistant_reply({
             "data": {"message": {"content": [
@@ -59,8 +60,47 @@ class DshBridgeHelperTests(unittest.TestCase):
         self.assertEqual(parse_json_value("raw-text"), "raw-text")
         self.assertEqual(read_path({"a": {"b": 1}}, ["a", "b"]), 1)
 
+    def test_session_setup_wizard_builds_per_chat_options(self):
+        wizard = SessionSetupWizard(
+            "D:/AI/workspace",
+            [{"id": "standard", "name": "Standard"}],
+            [{"provider": "deepseek", "model": "v4", "efforts": ["low", "high"]}],
+        )
+        wizard.process("D:/project")
+        wizard.process("1")
+        wizard.process("1")
+        wizard.process("2")
+        wizard.process("2")
+        wizard.process("1")
+        result = wizard.process("y")
+        self.assertTrue(result.confirmed)
+        self.assertEqual(wizard.options, {
+            "working_directory": "D:/project",
+            "agent_preset": "standard",
+            "provider": "deepseek",
+            "model": "v4",
+            "reasoning_effort": "high",
+            "permission_preset": "workspace-write",
+            "client_time_zone": "Asia/Shanghai",
+        })
+        self.assertIn("当前聊天", format_session_options(wizard.options))
+
+    def test_invalid_saved_timezone_falls_back_to_utc(self):
+        options = normalize_session_options({"client_time_zone": "中国标准时间"})
+        self.assertEqual(options["client_time_zone"], "Asia/Shanghai")
+
+    def test_explicit_iana_timezone_is_preserved(self):
+        self.assertEqual(normalize_client_time_zone("Asia/Shanghai"), "Asia/Shanghai")
+        self.assertEqual(normalize_client_time_zone("UTC"), "UTC")
+
 
 class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prompt_uses_dsh_compatible_iana_time_zone(self):
+        client = CaptureClient()
+        await client.prompt(None, "session-a", "hello", client_time_zone="Asia/Shanghai")
+        payload = client.calls[0][1]
+        self.assertEqual(payload["clientTimeZone"], "Asia/Shanghai")
+
     async def test_settings_mutation_uses_revision_and_path_operation(self):
         client = CaptureClient()
         await client.mutate_settings(None, "llm-deepseek", [{"op": "set", "path": ["maxTokens"], "value": 4096}], 7)
@@ -126,8 +166,26 @@ class DshSessionStateTests(unittest.IsolatedAsyncioTestCase):
         await state.clear_session(plugin, "chat-a")
         self.assertIsNone(await state.load_session(plugin, "chat-a"))
 
+    async def test_session_options_are_isolated_by_chat(self):
+        class Plugin:
+            def __init__(self):
+                self.store = {}
 
-class DshBridgeImageTests(unittest.IsolatedAsyncioTestCase):
+            async def get_kv_data(self, key, default):
+                return self.store.get(key, default)
+
+            async def put_kv_data(self, key, value):
+                self.store[key] = value
+
+        plugin = Plugin()
+        state = SessionState()
+        await state.update_options(plugin, "chat-a", {"working_directory": "D:/A"})
+        await state.update_options(plugin, "chat-b", {"working_directory": "D:/B"})
+        self.assertEqual((await state.load_options(plugin, "chat-a"))["working_directory"], "D:/A")
+        self.assertEqual((await state.load_options(plugin, "chat-b"))["working_directory"], "D:/B")
+
+
+class DshConnectorImageTests(unittest.IsolatedAsyncioTestCase):
     async def test_data_url_becomes_an_astrbot_image_component(self):
         from main import Main
 
@@ -161,7 +219,7 @@ class DshBridgeImageTests(unittest.IsolatedAsyncioTestCase):
         plugin.config = {"enable_llm_tools": True, "enable_llm_mutation_tools": False}
         request = type("Request", (), {"func_tool": FunctionTools()})()
         await plugin.on_llm_request(None, request)
-        self.assertEqual(request.func_tool.removed, ["dsh_bridge_set_dsh_setting"])
+        self.assertEqual(request.func_tool.removed, ["dsh_connector_set_dsh_setting"])
 
 
 if __name__ == "__main__":

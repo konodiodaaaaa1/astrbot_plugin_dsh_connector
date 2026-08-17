@@ -1,4 +1,4 @@
-"""Pure helpers used by the DSH bridge and its regression tests."""
+"""Pure helpers used by the DSH connector and its regression tests."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def assistant_reply(event: dict[str, Any]) -> DshReply:
 
     DSH content blocks are extensible. The parser deliberately accepts the
     documented text blocks plus the common image/attachment field variants so
-    newer DSH renderers can remain backwards compatible with this bridge.
+    newer DSH renderers can remain compatible with this connector.
     """
     data = event.get("data") or {}
     message = data.get("message") or {}

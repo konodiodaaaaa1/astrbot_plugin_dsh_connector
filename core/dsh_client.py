@@ -6,13 +6,14 @@ import asyncio
 import time
 import uuid
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 
 try:
-    from ..dsh_bridge_helpers import DshReply, event_seq, merge_replies
+    from ..dsh_connector_helpers import DshReply, event_seq, merge_replies
 except ImportError:
-    from dsh_bridge_helpers import DshReply, event_seq, merge_replies
+    from dsh_connector_helpers import DshReply, event_seq, merge_replies
 
 
 class DshError(Exception):
@@ -25,6 +26,27 @@ class DshConnectionError(DshError):
 
 class DshTimeout(DshError):
     """A DSH operation exceeded the connector timeout."""
+
+
+WINDOWS_TIME_ZONE_MAP = {
+    "中国标准时间": "Asia/Shanghai",
+    "China Standard Time": "Asia/Shanghai",
+}
+
+
+def normalize_client_time_zone(value: str = "") -> str:
+    """Return the IANA/UTC identifier accepted by DSH's prompt endpoint."""
+    candidate = str(value or "").strip()
+    if not candidate:
+        candidate = WINDOWS_TIME_ZONE_MAP.get(time.tzname[0], "UTC")
+    candidate = WINDOWS_TIME_ZONE_MAP.get(candidate, candidate)
+    if candidate != "UTC" and "/" not in candidate:
+        return "UTC"
+    try:
+        ZoneInfo(candidate)
+    except (ZoneInfoNotFoundError, ValueError):
+        return "UTC"
+    return candidate
 
 
 class DshHttpClient:
@@ -112,6 +134,7 @@ class DshHttpClient:
         session_id: str,
         text: str,
         mode: str = "queue",
+        client_time_zone: str = "",
     ) -> dict[str, Any]:
         return await self.rpc(
             session,
@@ -120,7 +143,7 @@ class DshHttpClient:
                 "sessionId": session_id,
                 "mode": mode,
                 "content": [{"type": "text", "text": text}],
-                "clientTimeZone": time.tzname[0],
+                "clientTimeZone": normalize_client_time_zone(client_time_zone),
             },
         )
 
@@ -310,11 +333,18 @@ class DshHttpClient:
         session_id: str,
         text: str,
         mode: str = "queue",
+        client_time_zone: str = "",
     ) -> DshReply:
         if mode == "queue":
             await self._wait_idle(session, session_id)
         baseline = await self._last_seq(session, session_id)
-        await self.prompt(session, session_id, text, mode=mode)
+        await self.prompt(
+            session,
+            session_id,
+            text,
+            mode=mode,
+            client_time_zone=client_time_zone,
+        )
         return await self._await_reply(session, session_id, baseline)
 
     async def _last_seq(self, session: aiohttp.ClientSession, session_id: str) -> int:

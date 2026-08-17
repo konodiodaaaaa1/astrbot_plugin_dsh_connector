@@ -39,25 +39,32 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
 try:
-    from .dsh_bridge_helpers import DshReply, merge_replies, model_rows
-    from .core.dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout
+    from .dsh_connector_helpers import DshReply, merge_replies, model_rows
+    from .core.dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout, normalize_client_time_zone
     from .core.config_service import compact_json, dotted_path, format_namespaces, namespace_map, parse_json_value, read_path
     from .core.presentation import current_goal, projection_values, session_label
     from .core.session_state import SessionState
+    from .core.session_options import (
+        SessionSetupWizard, format_session_options, normalize_session_options, resolve_option_field,
+    )
 except ImportError:  # AstrBot also supports loading a plugin main.py as a module.
-    from dsh_bridge_helpers import DshReply, merge_replies, model_rows
-    from core.dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout
+    from dsh_connector_helpers import DshReply, merge_replies, model_rows
+    from core.dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout, normalize_client_time_zone
     from core.config_service import compact_json, dotted_path, format_namespaces, namespace_map, parse_json_value, read_path
     from core.presentation import current_goal, projection_values, session_label
     from core.session_state import SessionState
+    from core.session_options import SessionSetupWizard, format_session_options, normalize_session_options, resolve_option_field
 
-HELP_TEXT = """【DeepSeek Harness 桥接】
+HELP_TEXT = """【DeepSeek Harness Connector】
 用法：
   /dsh <指令>    将指令发送给 DeepSeek Harness 执行并返回结果
   /dsh status    查看连接状态
   /dsh sessions  查看 DSH 会话列表
+  /dsh setup     为当前聊天配置选项并创建新会话
+  /dsh config [set <字段> <值>|reset]  管理当前聊天的新会话选项
   /dsh session switch <id> | rename <标题> | fork [seq] | search <关键词>
   /dsh model [服务商/模型] [推理强度]  查看或切换模型
   /dsh providers | global-models  查看 DSH 服务商与全局模型目录
@@ -72,7 +79,7 @@ HELP_TEXT = """【DeepSeek Harness 桥接】
   /dsh stop      取消当前会话正在执行的任务
   /dsh history [条数]  查看当前会话最近记录
   /dsh reset     重置当前聊天绑定的 DSH 会话
-  /dsh settings  查看插件与 DSH 运行配置
+  /dsh settings  查看 DSH 主机设置命名空间
 
 示例：
   /dsh 帮我写一段 Python 快速排序代码
@@ -138,14 +145,13 @@ class Main(Star):
         except Exception:
             pass
 
-    async def _load_chat_option(self, chat_key: str, key: str, default: str = "") -> str:
-        return await self._state.load_option(self, chat_key, key, default)
+    async def _load_session_options(self, event: AstrMessageEvent) -> dict[str, str]:
+        return await self._state.load_options(self, await self._chat_key(event))
 
-    async def _save_chat_option(self, chat_key: str, key: str, value: str) -> None:
-        try:
-            await self._state.save_option(self, chat_key, key, value)
-        except Exception as exc:
-            logger.warning(f"保存 DSH {key} 设置失败：{exc}")
+    async def _save_session_options(
+        self, event: AstrMessageEvent, options: dict[str, str]
+    ) -> dict[str, str]:
+        return await self._state.save_options(self, await self._chat_key(event), options)
 
     async def _session_for_chat(
         self,
@@ -154,36 +160,44 @@ class Main(Star):
         http_session: aiohttp.ClientSession,
     ) -> str:
         chat_key = await self._chat_key(event)
-        if self._cfg("persistent_session", True):
-            session_id = await self._load_session_id(chat_key)
-            if session_id:
-                return session_id
+        session_id = await self._load_session_id(chat_key)
+        if session_id:
+            return session_id
 
-        cwd = str(self._cfg("default_working_directory", "") or "").strip()
+        options = await self._state.load_options(self, chat_key)
+        cwd = options["working_directory"]
         if not cwd:
             cwd = str((await client.describe(http_session)).get("cwd") or "").strip()
-        default_preset = str(self._cfg("default_agent_preset", "") or "").strip()
-        agent_preset = await self._load_chat_option(chat_key, "agent_preset", default_preset)
-        session_id = await client.create_session(http_session, cwd=cwd, agent_preset=agent_preset)
-        await self._configure_session_defaults(client, http_session, session_id)
-        if self._cfg("persistent_session", True):
-            await self._save_session_id(chat_key, session_id)
+        session_id = await client.create_session(
+            http_session,
+            cwd=cwd,
+            agent_preset=options["agent_preset"],
+        )
+        await self._configure_session_options(client, http_session, session_id, options)
+        await self._save_session_id(chat_key, session_id)
         return session_id
 
-    async def _configure_session_defaults(
+    async def _configure_session_options(
         self,
         client: DshHttpClient,
         http_session: aiohttp.ClientSession,
         session_id: str,
+        options: dict[str, str],
     ) -> None:
-        provider = str(self._cfg("default_provider", "") or "").strip()
-        model = str(self._cfg("default_model", "") or "").strip()
-        effort = str(self._cfg("default_reasoning_effort", "") or "").strip()
+        options = normalize_session_options(options)
+        provider = options["provider"]
+        model = options["model"]
+        effort = options["reasoning_effort"]
         if provider and model:
             await client.select_model(http_session, session_id, provider, model, effort)
-        permission = str(self._cfg("default_permission_preset", "") or "").strip()
+        permission = options["permission_preset"]
         if permission:
-            await client.prompt(http_session, session_id, f"/permission {permission}")
+            await client.prompt(
+                http_session,
+                session_id,
+                f"/permission {permission}",
+                client_time_zone=options["client_time_zone"],
+            )
 
     # ---------------- 传输实现 ----------------
 
@@ -191,7 +205,14 @@ class Main(Star):
         client = self._make_http_client()
         async with aiohttp.ClientSession() as http_session:
             session_id = await self._session_for_chat(event, client, http_session)
-            return await client.run_prompt(http_session, session_id, text, mode=prompt_mode)
+            options = await self._load_session_options(event)
+            return await client.run_prompt(
+                http_session,
+                session_id,
+                text,
+                mode=prompt_mode,
+                client_time_zone=options["client_time_zone"],
+            )
 
     async def _run_headless(self, text: str) -> DshReply:
         profile = str(self._cfg("dsh_profile", "headless") or "headless").strip()
@@ -347,7 +368,14 @@ class Main(Star):
         if lowered in ("reset", "new", "重置", "清空"):
             yield event.plain_result(await self._reset_chat(event))
             return
-        if lowered in ("settings", "config", "配置", "设置"):
+        if lowered in ("setup", "wizard", "向导", "会话配置"):
+            async for result in self._setup_session(event):
+                yield result
+            return
+        if lowered in ("config", "配置") or lowered.startswith(("config ", "配置 ")):
+            yield event.plain_result(await self._session_config_command(event, text))
+            return
+        if lowered in ("settings", "设置"):
             yield event.plain_result(await self._dsh_settings_command(event, "settings"))
             return
         if lowered.startswith(("setting ", "设置 ")):
@@ -544,6 +572,15 @@ class Main(Star):
             finally:
                 await http_session.close()
             item = selected.get("selected") or selected
+            await self._state.update_options(
+                self,
+                await self._chat_key(event),
+                {
+                    "provider": str(item.get("provider", provider)),
+                    "model": str(item.get("model", model)),
+                    "reasoning_effort": str(item.get("reasoningEffort", effort) or ""),
+                },
+            )
             return f"已切换模型：{item.get('provider', provider)}/{item.get('model', model)}，推理：{item.get('reasoningEffort', effort or '默认')}"
         except DshError as exc:
             return f"❌ {exc}"
@@ -566,9 +603,20 @@ class Main(Star):
         try:
             client, http_session, session_id = await self._active_http_session(event)
             try:
-                await client.prompt(http_session, session_id, f"/permission {parts[1].strip()}")
+                options = await self._load_session_options(event)
+                await client.prompt(
+                    http_session,
+                    session_id,
+                    f"/permission {parts[1].strip()}",
+                    client_time_zone=options["client_time_zone"],
+                )
             finally:
                 await http_session.close()
+            await self._state.update_options(
+                self,
+                await self._chat_key(event),
+                {"permission_preset": parts[1].strip()},
+            )
             return f"已发送 DSH 权限预设：{parts[1].strip()}"
         except DshError as exc:
             return f"❌ {exc}"
@@ -595,34 +643,146 @@ class Main(Star):
             if action == "select":
                 if len(parts) < 3:
                     return "用法：/dsh preset select <名称>"
+                selected_preset = parts[2].strip()
                 client, http_session, session_id = await self._active_http_session(event)
                 try:
-                    value = await client.select_preset(http_session, session_id, parts[2].strip())
+                    value = await client.select_preset(http_session, session_id, selected_preset)
                 finally:
                     await http_session.close()
-                return f"当前会话已切换 Agent Preset：{value.get('agentPreset')}"
-            # Keep the concise legacy form as a per-chat default for the next session.
+                applied_preset = str(value.get("agentPreset") or selected_preset)
+                await self._state.update_options(
+                    self,
+                    await self._chat_key(event),
+                    {"agent_preset": applied_preset},
+                )
+                return f"当前会话已切换 Agent Preset：{applied_preset}"
+            # The concise form stores the preset for this chat's next session.
             chat_key = await self._chat_key(event)
-            await self._save_chat_option(chat_key, "agent_preset", command.split(maxsplit=1)[1].strip())
+            await self._state.update_options(
+                self,
+                chat_key,
+                {"agent_preset": command.split(maxsplit=1)[1].strip()},
+            )
             return f"已设置当前聊天的新会话 Agent Preset：{command.split(maxsplit=1)[1].strip()}。执行 /dsh reset 后生效。"
         except DshError as exc:
             return f"❌ {exc}"
 
     async def _settings_text(self, event: AstrMessageEvent) -> str:
-        chat_key = await self._chat_key(event)
-        preset = await self._load_chat_option(chat_key, "agent_preset", str(self._cfg("default_agent_preset", "") or ""))
+        options = await self._load_session_options(event)
         return "\n".join([
-            "【DSH Bridge 配置】",
+            "【DSH Connector】",
             f"mode={self.mode}",
             f"http_base_url={self._cfg('http_base_url', 'http://127.0.0.1:3080')}",
-            f"persistent_session={self._cfg('persistent_session', True)}",
-            f"working_directory={self._cfg('default_working_directory', '') or 'DSH 默认'}",
-            f"agent_preset={preset or 'DSH 默认'}",
-            f"default_model={self._cfg('default_provider', '')}/{self._cfg('default_model', '')}",
-            f"default_reasoning_effort={self._cfg('default_reasoning_effort', '') or 'DSH 默认'}",
-            f"default_permission_preset={self._cfg('default_permission_preset', '') or 'DSH 默认'}",
             f"图片：max_images_per_reply={self._cfg('max_images_per_reply', 4)}，max_image_bytes={self._cfg('max_image_bytes', 5242880)}",
+            "",
+            format_session_options(options),
         ])
+
+    async def _session_config_command(self, event: AstrMessageEvent, command: str) -> str:
+        parts = command.split(maxsplit=3)
+        options = await self._load_session_options(event)
+        if len(parts) == 1:
+            return format_session_options(options)
+        action = parts[1].lower()
+        if action in {"reset", "clear-all"}:
+            cleared = await self._state.clear_options(self, await self._chat_key(event))
+            return "已重置当前聊天的新会话选项。\n" + format_session_options(cleared)
+        if action not in {"set", "clear", "unset"} or len(parts) < 3:
+            return "用法：/dsh config；/dsh config set <cwd|preset|model|effort|permission|timezone> <值>；/dsh config clear <字段>；/dsh config reset"
+        field = resolve_option_field(parts[2])
+        if not field:
+            return f"未知会话选项：{parts[2]}"
+        if action == "set" and len(parts) < 4:
+            return f"请提供 {parts[2]} 的值。"
+        value = "" if action in {"clear", "unset"} else parts[3].strip()
+        changes: dict[str, str]
+        if field == "model":
+            if value and "/" not in value:
+                return "模型格式：provider/model"
+            provider, model = value.split("/", 1) if value else ("", "")
+            changes = {"provider": provider, "model": model}
+            if not value:
+                changes["reasoning_effort"] = ""
+        elif field == "client_time_zone":
+            normalized = normalize_client_time_zone(value)
+            if value and normalized == "UTC" and value.upper() != "UTC":
+                return "时区需要是 UTC 或有效 IANA Area/Location 名称，例如 Asia/Shanghai。"
+            changes = {field: normalized}
+        else:
+            changes = {field: value}
+        updated = await self._state.update_options(self, await self._chat_key(event), changes)
+        return "已更新当前聊天的新会话选项。执行 /dsh session new 应用。\n" + format_session_options(updated)
+
+    async def _create_session_from_options(
+        self, event: AstrMessageEvent, options: dict[str, str]
+    ) -> str:
+        await self._require_http()
+        client = self._make_http_client()
+        normalized = normalize_session_options(options)
+        async with aiohttp.ClientSession() as http_session:
+            cwd = normalized["working_directory"]
+            if not cwd:
+                cwd = str((await client.describe(http_session)).get("cwd") or "")
+            session_id = await client.create_session(
+                http_session,
+                cwd=cwd,
+                agent_preset=normalized["agent_preset"],
+            )
+            await self._configure_session_options(
+                client,
+                http_session,
+                session_id,
+                normalized,
+            )
+        await self._save_session_id(await self._chat_key(event), session_id)
+        return session_id
+
+    async def _setup_session(self, event: AstrMessageEvent):
+        try:
+            await self._require_http()
+            client = self._make_http_client()
+            async with aiohttp.ClientSession() as http_session:
+                host = await client.describe(http_session)
+                presets_value = await client.presets(http_session)
+                models_value = await client.global_models(http_session)
+            wizard = SessionSetupWizard(
+                str(host.get("cwd") or ""),
+                presets_value.get("presets") or [],
+                model_rows(models_value),
+                await self._load_session_options(event),
+            )
+        except DshError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+
+        yield event.plain_result(wizard.initial_prompt())
+
+        @session_waiter(timeout=120, record_history_chains=False)
+        async def setup_waiter(controller: SessionController, incoming: AstrMessageEvent):
+            result = wizard.process(incoming.message_str)
+            if result.cancelled:
+                await incoming.send(incoming.plain_result(result.prompt))
+                controller.stop()
+                return
+            if result.confirmed:
+                await incoming.send(incoming.plain_result(result.prompt))
+                try:
+                    await self._save_session_options(incoming, wizard.options)
+                    session_id = await self._create_session_from_options(incoming, wizard.options)
+                    await incoming.send(incoming.plain_result(f"已创建并绑定 DSH 会话：{session_id}"))
+                except DshError as exc:
+                    await incoming.send(incoming.plain_result(f"创建 DSH 会话失败：{exc}"))
+                controller.stop()
+                return
+            await incoming.send(incoming.plain_result(result.prompt))
+            controller.keep(timeout=120, reset_timeout=True)
+
+        try:
+            await setup_waiter(event)
+        except TimeoutError:
+            yield event.plain_result("DSH 会话配置超时，已退出。")
+        finally:
+            event.stop_event()
 
     async def _dsh_settings_command(self, event: AstrMessageEvent, command: str) -> str:
         """Expose the DSH settings document without maintaining a stale local schema."""
@@ -699,6 +859,10 @@ class Main(Star):
                 rows = result.get("items") or []
                 return "\n".join(["【DSH 会话搜索】"] + [f"- {row.get('sessionId')} {row.get('snippet', '')}" for row in rows]) or "未找到匹配会话。"
             chat_key = await self._chat_key(event)
+            if action == "new":
+                options = await self._load_session_options(event)
+                session_id = await self._create_session_from_options(event, options)
+                return f"已按当前聊天选项创建并绑定 DSH 会话：{session_id}"
             async with aiohttp.ClientSession() as http_session:
                 if action == "switch":
                     if len(parts) < 3:
@@ -710,19 +874,6 @@ class Main(Star):
                         return f"DSH 中没有会话：{wanted}"
                     await self._save_session_id(chat_key, session_id)
                     return f"当前聊天已绑定 DSH 会话：{session_id}"
-                if action == "new":
-                    session_id = await self._session_for_chat(event, client, http_session) if not self._cfg("persistent_session", True) else ""
-                    if session_id:
-                        await self._save_session_id(chat_key, session_id)
-                        return f"已创建并绑定 DSH 会话：{session_id}"
-                    cwd = str(self._cfg("default_working_directory", "") or "") or str((await client.describe(http_session)).get("cwd") or "")
-                    preset = await self._load_chat_option(
-                        chat_key, "agent_preset", str(self._cfg("default_agent_preset", "") or "")
-                    )
-                    session_id = await client.create_session(http_session, cwd=cwd, agent_preset=preset)
-                    await self._configure_session_defaults(client, http_session, session_id)
-                    await self._save_session_id(chat_key, session_id)
-                    return f"已创建并绑定 DSH 会话：{session_id}"
                 session_id = await self._session_for_chat(event, client, http_session)
                 if action == "rename":
                     if len(parts) < 3:
@@ -882,34 +1033,34 @@ class Main(Star):
         if not getattr(request, "func_tool", None):
             return
         tool_names = {
-            "dsh_bridge_get_status",
-            "dsh_bridge_list_sessions",
-            "dsh_bridge_get_models",
-            "dsh_bridge_send_prompt",
-            "dsh_bridge_create_session",
-            "dsh_bridge_set_model",
-            "dsh_bridge_set_permission",
-            "dsh_bridge_stop",
-            "dsh_bridge_get_config",
-            "dsh_bridge_search_sessions",
-            "dsh_bridge_get_dsh_settings",
-            "dsh_bridge_get_providers",
-            "dsh_bridge_list_skills",
-            "dsh_bridge_list_workspaces",
-            "dsh_bridge_set_dsh_setting",
-            "dsh_bridge_list_presets",
-            "dsh_bridge_list_subagents",
-            "dsh_bridge_get_goal",
-            "dsh_bridge_manage_session",
+            "dsh_connector_get_status",
+            "dsh_connector_list_sessions",
+            "dsh_connector_get_models",
+            "dsh_connector_send_prompt",
+            "dsh_connector_create_session",
+            "dsh_connector_set_model",
+            "dsh_connector_set_permission",
+            "dsh_connector_stop",
+            "dsh_connector_get_config",
+            "dsh_connector_search_sessions",
+            "dsh_connector_get_dsh_settings",
+            "dsh_connector_get_providers",
+            "dsh_connector_list_skills",
+            "dsh_connector_list_workspaces",
+            "dsh_connector_set_dsh_setting",
+            "dsh_connector_list_presets",
+            "dsh_connector_list_subagents",
+            "dsh_connector_get_goal",
+            "dsh_connector_manage_session",
         }
         if not self._llm_tools_available():
             for tool_name in tool_names:
                 request.func_tool.remove_tool(tool_name)
             return
         if not self._llm_mutations_available():
-            request.func_tool.remove_tool("dsh_bridge_set_dsh_setting")
+            request.func_tool.remove_tool("dsh_connector_set_dsh_setting")
 
-    @filter.llm_tool(name="dsh_bridge_get_status")
+    @filter.llm_tool(name="dsh_connector_get_status")
     async def tool_get_status(self, event: AstrMessageEvent):
         """读取 DeepSeek Harness 主机状态、版本、当前模型与工作目录。"""
         if not self._llm_tools_available():
@@ -917,7 +1068,7 @@ class Main(Star):
             return
         yield await self._status_text()
 
-    @filter.llm_tool(name="dsh_bridge_list_sessions")
+    @filter.llm_tool(name="dsh_connector_list_sessions")
     async def tool_list_sessions(self, event: AstrMessageEvent):
         """列出 DSH 已有会话及其运行状态、工作目录、Agent 预设。"""
         if not self._llm_tools_available():
@@ -925,7 +1076,7 @@ class Main(Star):
             return
         yield await self._sessions_text()
 
-    @filter.llm_tool(name="dsh_bridge_get_models")
+    @filter.llm_tool(name="dsh_connector_get_models")
     async def tool_get_models(self, event: AstrMessageEvent):
         """查询当前 DSH 会话模型、服务商和可用推理强度。"""
         if not self._llm_tools_available():
@@ -933,7 +1084,7 @@ class Main(Star):
             return
         yield await self._model_command(event, "model")
 
-    @filter.llm_tool(name="dsh_bridge_send_prompt")
+    @filter.llm_tool(name="dsh_connector_send_prompt")
     async def tool_send_prompt(self, event: AstrMessageEvent, prompt: str, steer: bool = False):
         """向当前聊天绑定的 DSH 会话发送任务。
 
@@ -953,7 +1104,7 @@ class Main(Star):
         except DshError as exc:
             yield f"DSH 调用失败：{exc}"
 
-    @filter.llm_tool(name="dsh_bridge_create_session")
+    @filter.llm_tool(name="dsh_connector_create_session")
     async def tool_create_session(
         self,
         event: AstrMessageEvent,
@@ -963,31 +1114,25 @@ class Main(Star):
         """创建并绑定一个新的 DSH 会话。
 
         Args:
-            working_directory(string): DSH 工作目录；留空沿用插件默认目录。
-            agent_preset(string): DSH Agent 预设；留空沿用当前聊天预设。
+            working_directory(string): DSH 工作目录；留空沿用当前聊天会话选项。
+            agent_preset(string): DSH Agent 预设；留空沿用当前聊天会话选项。
         """
         if not self._llm_tools_available():
             yield "DSH LLM 工具当前未启用。请在插件配置中设置 enable_llm_tools=true。"
             return
         try:
             await self._require_http()
-            client = self._make_http_client()
-            chat_key = await self._chat_key(event)
-            async with aiohttp.ClientSession() as http_session:
-                cwd = working_directory.strip() or str(self._cfg("default_working_directory", "") or "").strip()
-                if not cwd:
-                    cwd = str((await client.describe(http_session)).get("cwd") or "")
-                preset = agent_preset.strip() or await self._load_chat_option(
-                    chat_key, "agent_preset", str(self._cfg("default_agent_preset", "") or "")
-                )
-                session_id = await client.create_session(http_session, cwd=cwd, agent_preset=preset)
-                await self._configure_session_defaults(client, http_session, session_id)
-            await self._save_session_id(chat_key, session_id)
+            options = await self._load_session_options(event)
+            if working_directory.strip():
+                options["working_directory"] = working_directory.strip()
+            if agent_preset.strip():
+                options["agent_preset"] = agent_preset.strip()
+            session_id = await self._create_session_from_options(event, options)
             yield f"已创建并绑定 DSH 会话：{session_id}"
         except DshError as exc:
             yield f"创建 DSH 会话失败：{exc}"
 
-    @filter.llm_tool(name="dsh_bridge_set_model")
+    @filter.llm_tool(name="dsh_connector_set_model")
     async def tool_set_model(self, event: AstrMessageEvent, provider: str, model: str, reasoning_effort: str = ""):
         """切换当前 DSH 会话的 provider、模型和可选推理强度。"""
         if not self._llm_tools_available():
@@ -995,7 +1140,7 @@ class Main(Star):
             return
         yield await self._model_command(event, f"model {provider}/{model} {reasoning_effort}".strip())
 
-    @filter.llm_tool(name="dsh_bridge_set_permission")
+    @filter.llm_tool(name="dsh_connector_set_permission")
     async def tool_set_permission(self, event: AstrMessageEvent, preset: str):
         """设置当前 DSH 会话权限预设，如 read-only、workspace-write、danger-full-access。"""
         if not self._llm_tools_available():
@@ -1003,7 +1148,7 @@ class Main(Star):
             return
         yield await self._permission_command(event, f"permission {preset}")
 
-    @filter.llm_tool(name="dsh_bridge_stop")
+    @filter.llm_tool(name="dsh_connector_stop")
     async def tool_stop(self, event: AstrMessageEvent):
         """取消当前聊天绑定的 DSH 会话正在执行的任务。"""
         if not self._llm_tools_available():
@@ -1011,12 +1156,12 @@ class Main(Star):
             return
         yield await self._cancel(event)
 
-    @filter.llm_tool(name="dsh_bridge_get_config")
+    @filter.llm_tool(name="dsh_connector_get_config")
     async def tool_get_config(self, event: AstrMessageEvent):
-        """读取 DSH Bridge 的连接、默认会话、模型、权限与图片渲染配置。"""
+        """读取 DSH Connector 连接状态和当前聊天的新会话选项。"""
         yield await self._settings_text(event)
 
-    @filter.llm_tool(name="dsh_bridge_search_sessions")
+    @filter.llm_tool(name="dsh_connector_search_sessions")
     async def tool_search_sessions(self, event: AstrMessageEvent, query: str):
         """在 DSH 全部历史会话中检索标题和消息片段。
 
@@ -1028,7 +1173,7 @@ class Main(Star):
             return
         yield await self._session_command(event, f"session search {query}")
 
-    @filter.llm_tool(name="dsh_bridge_get_dsh_settings")
+    @filter.llm_tool(name="dsh_connector_get_dsh_settings")
     async def tool_get_dsh_settings(self, event: AstrMessageEvent, namespace: str = "", path: str = "", include_schema: bool = False):
         """读取 DSH 已注册的配置命名空间，或读取一个命名空间中的具体路径。
 
@@ -1045,7 +1190,7 @@ class Main(Star):
         )
         yield await self._dsh_settings_command(event, command)
 
-    @filter.llm_tool(name="dsh_bridge_get_providers")
+    @filter.llm_tool(name="dsh_connector_get_providers")
     async def tool_get_providers(self, event: AstrMessageEvent):
         """列出 DSH 当前已配置的 LLM 服务商、配置命名空间和启用状态。"""
         if not self._llm_tools_available():
@@ -1053,7 +1198,7 @@ class Main(Star):
             return
         yield await self._providers_text()
 
-    @filter.llm_tool(name="dsh_bridge_list_skills")
+    @filter.llm_tool(name="dsh_connector_list_skills")
     async def tool_list_skills(self, event: AstrMessageEvent):
         """列出当前 DSH 会话可用的 Skills 及模型调用资格。"""
         if not self._llm_tools_available():
@@ -1061,7 +1206,7 @@ class Main(Star):
             return
         yield await self._skills_text(event)
 
-    @filter.llm_tool(name="dsh_bridge_list_workspaces")
+    @filter.llm_tool(name="dsh_connector_list_workspaces")
     async def tool_list_workspaces(self, event: AstrMessageEvent):
         """列出 DSH 已注册的工作区及其会话数量。"""
         if not self._llm_tools_available():
@@ -1069,7 +1214,7 @@ class Main(Star):
             return
         yield await self._workspaces_command(event, "workspaces")
 
-    @filter.llm_tool(name="dsh_bridge_set_dsh_setting")
+    @filter.llm_tool(name="dsh_connector_set_dsh_setting")
     async def tool_set_dsh_setting(self, event: AstrMessageEvent, namespace: str, path: str, value_json: str):
         """以 DSH 原生 settings.mutate 接口更新一个设置路径。
 
@@ -1083,7 +1228,7 @@ class Main(Star):
             return
         yield await self._dsh_settings_command(event, f"setting set {namespace} {path} {value_json}")
 
-    @filter.llm_tool(name="dsh_bridge_list_presets")
+    @filter.llm_tool(name="dsh_connector_list_presets")
     async def tool_list_presets(self, event: AstrMessageEvent):
         """列出 DSH 已加载的 Agent Presets、信任级别和默认项。"""
         if not self._llm_tools_available():
@@ -1091,7 +1236,7 @@ class Main(Star):
             return
         yield await self._preset_command(event, "preset list")
 
-    @filter.llm_tool(name="dsh_bridge_list_subagents")
+    @filter.llm_tool(name="dsh_connector_list_subagents")
     async def tool_list_subagents(self, event: AstrMessageEvent):
         """列出当前 DSH 会话的子代理、运行状态和模式。"""
         if not self._llm_tools_available():
@@ -1099,7 +1244,7 @@ class Main(Star):
             return
         yield await self._subagents_command(event, "subagents")
 
-    @filter.llm_tool(name="dsh_bridge_get_goal")
+    @filter.llm_tool(name="dsh_connector_get_goal")
     async def tool_get_goal(self, event: AstrMessageEvent):
         """读取当前 DSH 会话的 Goal id、revision、目标和阶段。"""
         if not self._llm_tools_available():
@@ -1107,7 +1252,7 @@ class Main(Star):
             return
         yield await self._goal_command(event, "goal")
 
-    @filter.llm_tool(name="dsh_bridge_manage_session")
+    @filter.llm_tool(name="dsh_connector_manage_session")
     async def tool_manage_session(self, event: AstrMessageEvent, action: str, value: str = ""):
         """切换、重命名或分叉当前聊天绑定的 DSH 会话。
 
