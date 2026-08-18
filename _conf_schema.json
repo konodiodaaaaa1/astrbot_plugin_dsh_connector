@@ -3,6 +3,7 @@
   "http_base_url": {"description": "DSH Web API 地址", "type": "string", "default": "http://127.0.0.1:3080", "hint": "对应 dsh web --port 3080 的地址"},
   "command_timeout": {"description": "单次任务超时（秒）", "type": "int", "default": 600},
   "poll_interval": {"description": "HTTP 轮询间隔（秒）", "type": "float", "default": 1.0},
+  "stream_replies": {"description": "实时回传 DSH 文本", "type": "bool", "default": true, "hint": "HTTP/auto 模式下将 assistant/chunk 增量实时发送到聊天端；关闭后等待完整回复再发送"},
   "enable_llm_tools": {"description": "启用 LLM 调用 DSH 工具", "type": "bool", "default": false, "hint": "开启后 AstrBot 的 LLM 可查询、创建和控制 DSH 会话"},
   "enable_llm_mutation_tools": {"description": "允许 LLM 修改 DSH 设置", "type": "bool", "default": false, "hint": "仅在 enable_llm_tools=true 时生效；开启后 LLM 可经 settings.mutate 更新 DSH 配置"},
   "max_reply_chars": {"description": "文本回复最大字符数（0 表示不限制）", "type": "int", "default": 4000},

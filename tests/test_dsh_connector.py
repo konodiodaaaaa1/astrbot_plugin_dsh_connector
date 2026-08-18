@@ -23,6 +23,12 @@ class CaptureClient(DshHttpClient):
 
 
 class DshConnectorHelperTests(unittest.TestCase):
+    def test_help_lists_session_delete_command(self):
+        from main import HELP_TEXT
+
+        self.assertIn("/dsh help", HELP_TEXT)
+        self.assertIn("/dsh session delete [id]", HELP_TEXT)
+
     def test_assistant_reply_keeps_text_and_distinct_images(self):
         reply = assistant_reply({
             "data": {"message": {"content": [
@@ -66,6 +72,7 @@ class DshConnectorHelperTests(unittest.TestCase):
             "D:/AI/workspace",
             [{"id": "standard", "name": "Standard"}],
             [{"provider": "deepseek", "model": "v4", "efforts": ["low", "high"]}],
+            permission_presets=["read-only", "workspace-write", "danger-full-access"],
         )
         wizard.process("D:/project")
         wizard.process("1")
@@ -76,6 +83,7 @@ class DshConnectorHelperTests(unittest.TestCase):
         result = wizard.process("y")
         self.assertTrue(result.confirmed)
         self.assertEqual(wizard.options, {
+            "workspace_id": "",
             "working_directory": "D:/project",
             "agent_preset": "standard",
             "provider": "deepseek",
@@ -85,6 +93,42 @@ class DshConnectorHelperTests(unittest.TestCase):
             "client_time_zone": "Asia/Shanghai",
         })
         self.assertIn("当前聊天", format_session_options(wizard.options))
+
+    def test_session_setup_lists_and_selects_live_workspace_and_permissions(self):
+        wizard = SessionSetupWizard(
+            "D:/AI/workspace",
+            [{"id": "standard", "name": "Standard"}],
+            [{"provider": "deepseek", "model": "v4", "efforts": ["low"]}],
+            workspaces=[{
+                "workspaceId": "workspace-live",
+                "title": "Live Workspace",
+                "path": "D:/live",
+            }],
+            permission_presets=["sandboxed", "trusted"],
+        )
+        self.assertIn("Live Workspace", wizard.initial_prompt())
+        wizard.process("1")
+        wizard.process("0")
+        wizard.process("0")
+        wizard.process("0")
+        permission_prompt = wizard.process("0")
+        self.assertIn("sandboxed", permission_prompt.prompt)
+        self.assertIn("trusted", permission_prompt.prompt)
+        wizard.process("2")
+        wizard.process("1")
+        result = wizard.process("y")
+        self.assertTrue(result.confirmed)
+        self.assertEqual(wizard.options["workspace_id"], "workspace-live")
+        self.assertEqual(wizard.options["working_directory"], "")
+        self.assertEqual(wizard.options["permission_preset"], "trusted")
+
+    def test_directory_and_workspace_options_are_mutually_exclusive(self):
+        options = normalize_session_options({
+            "workspace_id": "workspace-live",
+            "working_directory": "D:/stale",
+        })
+        self.assertEqual(options["workspace_id"], "workspace-live")
+        self.assertEqual(options["working_directory"], "")
 
     def test_invalid_saved_timezone_falls_back_to_utc(self):
         options = normalize_session_options({"client_time_zone": "中国标准时间"})
@@ -104,6 +148,140 @@ class DshConnectorHelperTests(unittest.TestCase):
 
 
 class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_execute_command_uses_typert_remote_wire(self):
+        class Response:
+            status = 200
+
+            def __init__(self, request):
+                self.request = request
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def json(self):
+                return {
+                    "type": "server-response",
+                    "rpcId": self.request["rpcId"],
+                    "result": {"ok": True, "value": {
+                        "commandId": "cmd-test",
+                        "result": {"kind": "success", "text": "preset read-only"},
+                    }},
+                }
+
+            async def text(self):
+                return ""
+
+        class Session:
+            def __init__(self):
+                self.url = None
+                self.request = None
+
+            def post(self, url, **kwargs):
+                self.url = url
+                self.request = kwargs["json"]
+                return Response(self.request)
+
+        client = DshHttpClient("http://example.test", 1, 0.1)
+        session = Session()
+        result = await client.execute_command(session, "session-a", "/permission read-only")
+        self.assertEqual(session.url, "http://example.test/api/commands/execute")
+        self.assertEqual(session.request["method"], "commands/execute")
+        self.assertEqual(session.request["payload"], {
+            "args": {"agentId": "session-a", "line": "/permission read-only"},
+        })
+        self.assertEqual(result["result"]["text"], "preset read-only")
+
+    async def test_permission_presets_are_read_from_live_schema_shape(self):
+        class SettingsClient(DshHttpClient):
+            async def settings(self, _session):
+                return {"namespaces": [{
+                    "ns": "permission",
+                    "schema": {
+                        "uid": 14,
+                        "refs": {
+                            "11": {"type": "const", "value": "sandboxed"},
+                            "12": {"type": "const", "value": "trusted"},
+                            "13": {"type": "union", "list": [11, 12]},
+                            "14": {"type": "object", "dict": {"defaultPreset": 13}},
+                        },
+                    },
+                }]}
+
+        client = SettingsClient("http://example.test", 1, 0.1)
+        self.assertEqual(await client.permission_presets(None), ["sandboxed", "trusted"])
+
+    async def test_create_session_prefers_workspace_id(self):
+        client = CaptureClient()
+        await client.create_session(None, cwd="D:/ignored", workspace_id="workspace-live")
+        self.assertEqual(client.calls, [(
+            "session.create",
+            {"workspaceId": "workspace-live"},
+        )])
+
+    async def test_archive_session_uses_dsh_workspace_api(self):
+        client = CaptureClient()
+        await client.archive_session(None, "session-a")
+        self.assertEqual(client.calls, [("workspace.archiveSession", {"sessionId": "session-a"})])
+
+    async def test_history_streams_each_new_text_delta_once(self):
+        chunk_one = {"event": {"seq": 1, "type": "assistant/chunk", "data": {
+            "chunk": {"type": "text-delta", "text": "hel"},
+        }}}
+        chunk_two = {"event": {"seq": 2, "type": "assistant/chunk", "data": {
+            "chunk": {"type": "text-delta", "text": "lo"},
+        }}}
+        message = {"event": {"seq": 3, "type": "assistant/message", "data": {
+            "message": {"content": [{"type": "text", "text": "hello"}]},
+        }}}
+        end = {"event": {"seq": 4, "type": "turn/end", "data": {
+            "reason": {"kind": "completed"},
+        }}}
+
+        class StreamingClient(DshHttpClient):
+            def __init__(self):
+                super().__init__("http://example.test", 1, 0)
+                self.round = 0
+
+            async def history(self, _session, _session_id, max_messages=100):
+                self.round += 1
+                return [chunk_one] if self.round == 1 else [chunk_one, chunk_two, message, end]
+
+        streamed = []
+        reply = await StreamingClient()._await_reply(None, "session-a", 0, on_chunk=streamed.append)
+        self.assertEqual(streamed, ["hel", "lo"])
+        self.assertEqual(reply.text, "hello")
+
+    async def test_history_returns_only_last_assistant_message_from_multi_step_turn(self):
+        step_one = {"event": {"seq": 1, "type": "assistant/message", "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {"content": [{"type": "text", "text": "step progress"}]},
+        }}}
+        step_two = {"event": {"seq": 2, "type": "assistant/message", "data": {
+            "turn": 1,
+            "step": 2,
+            "message": {"content": [{"type": "text", "text": "final answer"}]},
+        }}}
+        end = {"event": {"seq": 3, "type": "turn/end", "data": {
+            "turn": 1,
+            "reason": {"kind": "completed"},
+        }}}
+
+        class MultiStepClient(DshHttpClient):
+            def __init__(self):
+                super().__init__("http://example.test", 1, 0)
+                self.round = 0
+
+            async def history(self, _session, _session_id, max_messages=100):
+                self.round += 1
+                return [step_one] if self.round == 1 else [step_one, step_two, end]
+
+        reply = await MultiStepClient()._await_reply(None, "session-a", 0)
+        self.assertEqual(reply.text, "final answer")
+
     async def test_prompt_uses_dsh_compatible_iana_time_zone(self):
         client = CaptureClient()
         await client.prompt(None, "session-a", "hello", client_time_zone="Asia/Shanghai")
@@ -195,6 +373,59 @@ class DshSessionStateTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DshConnectorImageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_card_mode_uses_only_completed_reply_path(self):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = {
+            "mode": "http",
+            "stream_replies": True,
+            "reply_render_mode": "card",
+        }
+        self.assertFalse(plugin._stream_replies_enabled())
+
+        plugin.config["reply_render_mode"] = "text"
+        self.assertTrue(plugin._stream_replies_enabled())
+
+    async def test_stream_reply_forwards_dsh_chunks_to_astrbot(self):
+        from main import Main
+        from astrbot.api.message_components import Plain
+
+        plugin = object.__new__(Main)
+
+        async def run(_event, _text, prompt_mode="queue", on_chunk=None):
+            await on_chunk("hello ")
+            await on_chunk("world")
+            return DshReply(text="hello world")
+
+        plugin._run = run
+
+        class Event:
+            def __init__(self):
+                self.chunks = []
+
+            async def send_streaming(self, generator, use_fallback=False):
+                self.assertTrue(use_fallback)
+                async for chain in generator:
+                    self.chunks.extend(part.text for part in chain.chain if isinstance(part, Plain))
+
+            def assertTrue(self, value):
+                if not value:
+                    raise AssertionError("expected true")
+
+        event = Event()
+        reply, streamed = await plugin._stream_reply(event, "prompt", "queue")
+        self.assertEqual(event.chunks, ["hello ", "world"])
+        self.assertEqual(streamed, "hello world")
+        self.assertEqual(reply.text, "hello world")
+
+    async def test_streamed_final_text_is_not_sent_twice(self):
+        from main import Main
+
+        self.assertEqual(Main._unstreamed_text("hello", "hello"), "")
+        self.assertEqual(Main._unstreamed_text("hello\nnext", "hello"), "next")
+        self.assertEqual(Main._unstreamed_text("final", "partial"), "final")
+
     async def test_card_mode_uses_astrbot_t2i_and_keeps_image_component(self):
         from main import Main
 

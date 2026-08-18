@@ -24,25 +24,27 @@ dsh web --port 3080
 
 向导依次选择：
 
-1. 工作目录
-2. Agent Preset
-3. Provider 与模型
-4. 推理强度
-5. 权限预设
-6. IANA 客户端时区
-7. 确认创建
+1. DSH 工作空间（可选）
+2. 工作目录
+3. Agent Preset
+4. Provider 与模型
+5. 推理强度
+6. 权限预设
+7. IANA 客户端时区
+8. 确认创建
 
-选项按聊天窗口保存在 AstrBot KV 中。完成向导后，连接器会创建并绑定新 DSH 会话。其他聊天窗口使用各自的选项和绑定。
+工作空间、Agent Preset、模型和权限预设均从当前 DSH 主机实时读取。工作空间与工作目录二选一；选择工作空间会使用 DSH `workspaceId` 创建会话，输入目录会改用该目录。它们按聊天窗口保存在 AstrBot KV 中，不进入插件固定配置。完成向导后，连接器会创建并绑定新 DSH 会话。其他聊天窗口使用各自的选项和绑定。
 
 也可以直接管理当前窗口的选项：
 
 ```text
 /dsh config
+/dsh config set workspace <workspaceId>
 /dsh config set cwd D:\AI\workspace
 /dsh config set preset standard
 /dsh config set model deepseek-official/deepseek-v4-pro
 /dsh config set effort high
-/dsh config set permission workspace-write
+/dsh config set permission <DSH 返回的权限预设>
 /dsh config set timezone Asia/Shanghai
 /dsh config clear effort
 /dsh config reset
@@ -50,6 +52,10 @@ dsh web --port 3080
 ```
 
 `/dsh session new` 使用当前聊天保存的选项创建会话。未配置的字段沿用 DSH 主机或模型默认值。
+
+`/dsh permission` 会读取并显示当前 DSH 实际提供的权限预设；`/dsh setup` 的权限步骤使用同一份动态列表。
+
+`/dsh session delete` 会要求输入 `delete` 再确认，并调用 DSH 的 `workspace.archiveSession` 从 DSH 会话列表移除目标会话；DSH 保留归档会话的历史日志。
 
 ## 会话与任务
 
@@ -62,6 +68,7 @@ dsh web --port 3080
 /dsh session search <关键词>
 /dsh session rename <标题>
 /dsh session fork [seq]
+/dsh session delete [sessionId]
 /dsh history [条数]
 /dsh reset
 ```
@@ -121,6 +128,10 @@ dsh web --port 3080
 - `card` 将所有 DSH 文本经 AstrBot t2i 渲染为图片卡
 
 卡片使用 AstrBot 当前配置的 t2i 模板和端点，因此复用已有的 Markdown、Shiki 代码高亮与 KaTeX 公式渲染能力。`card_max_chars` 会对长回复分卡，保留每段代码围栏；t2i 不可用时自动发送原始文本。DSH 原生图片和 attachment 保持独立图片消息输出。
+
+## 实时回复
+
+HTTP/auto 模式默认读取 DSH `assistant/chunk` 的 `text-delta` 并交给 AstrBot `send_streaming`。QQ 官方私聊和 Telegram 会实时更新回复，aiocqhttp 会按句子分段发送。通过插件配置中的 `stream_replies` 可关闭实时模式；卡片、DSH attachment 与其他图片仍会在任务完成后继续发送。
 
 ## LLM 工具
 

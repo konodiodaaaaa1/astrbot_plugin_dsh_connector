@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 import uuid
-from typing import Any
+from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 
 try:
-    from ..dsh_connector_helpers import DshReply, event_seq, merge_replies
+    from ..dsh_connector_helpers import DshReply, assistant_reply, event_seq
 except ImportError:
-    from dsh_connector_helpers import DshReply, event_seq, merge_replies
+    from dsh_connector_helpers import DshReply, assistant_reply, event_seq
 
 
 class DshError(Exception):
@@ -89,6 +90,54 @@ class DshHttpClient:
             raise DshError(f"DSH 错误 {error.get('code')}: {error.get('message')}{suffix}")
         return result.get("value")
 
+    async def execute_command(
+        self,
+        session: aiohttp.ClientSession,
+        session_id: str,
+        line: str,
+    ) -> dict[str, Any]:
+        """Execute a DSH host command through the Typert remote surface.
+
+        Commands use the slash-separated remote endpoint and put lookup/json
+        arguments under ``payload.args``. This is distinct from
+        ``session.prompt``: command output is handled by DSH directly and the
+        command lifecycle is persisted as DSH command events.
+        """
+        envelope = {
+            "type": "client-request",
+            "rpcId": str(uuid.uuid4()),
+            "method": "commands/execute",
+            "payload": {"args": {"agentId": session_id, "line": line}},
+        }
+        url = f"{self.base_url}/api/commands/execute"
+        try:
+            async with session.post(
+                url,
+                json=envelope,
+                headers={"content-type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+            ) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    raise DshError(f"DSH 返回 HTTP {response.status}: {body[:300]}")
+                data = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise DshConnectionError(f"连接 DeepSeek Harness 失败（{url}）：{exc}") from exc
+
+        if not isinstance(data, dict) or data.get("type") != "server-response":
+            raise DshError(f"DSH 返回了意外响应：{str(data)[:300]}")
+        result = data.get("result") or {}
+        if not result.get("ok"):
+            error = result.get("error") or {}
+            raise DshError(f"DSH 错误 {error.get('code')}: {error.get('message')}")
+        value = result.get("value")
+        if not isinstance(value, dict):
+            raise DshError("DSH 命令返回了意外结果")
+        command_result = value.get("result") or {}
+        if command_result.get("kind") == "error":
+            raise DshError(str(command_result.get("text") or "DSH 命令执行失败"))
+        return value
+
     async def describe(self, session: aiohttp.ClientSession) -> dict[str, Any]:
         return await self.rpc(session, "host.describe", {})
 
@@ -150,6 +199,11 @@ class DshHttpClient:
     async def cancel(self, session: aiohttp.ClientSession, session_id: str) -> bool:
         value = await self.rpc(session, "session.cancel", {"sessionId": session_id})
         return bool((value or {}).get("accepted"))
+
+    async def archive_session(self, session: aiohttp.ClientSession, session_id: str) -> dict[str, Any]:
+        """Remove a session from DSH's visible workspace list durably."""
+        value = await self.rpc(session, "workspace.archiveSession", {"sessionId": session_id})
+        return value if isinstance(value, dict) else {}
 
     async def history_value(
         self,
@@ -238,6 +292,28 @@ class DshHttpClient:
     async def settings(self, session: aiohttp.ClientSession) -> dict[str, Any]:
         value = await self.rpc(session, "settings.describe", {})
         return value if isinstance(value, dict) else {}
+
+    async def permission_presets(self, session: aiohttp.ClientSession) -> list[str]:
+        """Read the permission preset enum published by the DSH host."""
+        description = await self.settings(session)
+        namespace = next(
+            (row for row in description.get("namespaces") or []
+             if isinstance(row, dict) and row.get("ns") == "permission"),
+            None,
+        )
+        if not isinstance(namespace, dict):
+            return []
+        schema = namespace.get("schema") or {}
+        refs = schema.get("refs") or {}
+        root = refs.get(str(schema.get("uid"))) or {}
+        default_ref = (root.get("dict") or {}).get("defaultPreset")
+        union = refs.get(str(default_ref)) or {}
+        values: list[str] = []
+        for ref_id in union.get("list") or []:
+            value = (refs.get(str(ref_id)) or {}).get("value")
+            if isinstance(value, str) and value:
+                values.append(value)
+        return values
 
     async def mutate_settings(
         self,
@@ -334,6 +410,7 @@ class DshHttpClient:
         text: str,
         mode: str = "queue",
         client_time_zone: str = "",
+        on_chunk: Callable[[str], Awaitable[None] | None] | None = None,
     ) -> DshReply:
         if mode == "queue":
             await self._wait_idle(session, session_id)
@@ -345,7 +422,7 @@ class DshHttpClient:
             mode=mode,
             client_time_zone=client_time_zone,
         )
-        return await self._await_reply(session, session_id, baseline)
+        return await self._await_reply(session, session_id, baseline, on_chunk=on_chunk)
 
     async def _last_seq(self, session: aiohttp.ClientSession, session_id: str) -> int:
         events = await self.history(session, session_id, max_messages=5)
@@ -362,10 +439,15 @@ class DshHttpClient:
         raise DshTimeout(f"等待 DeepSeek Harness 会话空闲超时（{self.timeout} 秒）")
 
     async def _await_reply(
-        self, session: aiohttp.ClientSession, session_id: str, baseline: int
+        self,
+        session: aiohttp.ClientSession,
+        session_id: str,
+        baseline: int,
+        on_chunk: Callable[[str], Awaitable[None] | None] | None = None,
     ) -> DshReply:
         deadline = time.monotonic() + self.timeout
         last_reply = DshReply()
+        emitted_chunk_sequences: set[int] = set()
         while time.monotonic() < deadline:
             events = await self.history(session, session_id, max_messages=100)
             reason = None
@@ -373,9 +455,28 @@ class DshHttpClient:
                 event = entry.get("event") if isinstance(entry, dict) else None
                 if not event or event_seq(event) <= baseline:
                     continue
-                if event.get("type") == "assistant/message":
-                    last_reply = merge_replies(events, after_seq=baseline)
-                elif event.get("type") == "turn/end":
+                event_type = event.get("type")
+                if event_type == "assistant/chunk":
+                    sequence = event_seq(event)
+                    chunk = (event.get("data") or {}).get("chunk") or {}
+                    chunk_text = chunk.get("text") if chunk.get("type") == "text-delta" else None
+                    if (
+                        on_chunk is not None
+                        and sequence not in emitted_chunk_sequences
+                        and isinstance(chunk_text, str)
+                        and chunk_text
+                    ):
+                        emitted_chunk_sequences.add(sequence)
+                        callback_result = on_chunk(chunk_text)
+                        if inspect.isawaitable(callback_result):
+                            await callback_result
+                elif event_type == "assistant/message":
+                    # DSH emits one finalized assistant message per provider/tool
+                    # step. The last finalized message is the turn result; earlier
+                    # messages are intermediate step output and must not be folded
+                    # into the final card.
+                    last_reply = assistant_reply(event)
+                elif event_type == "turn/end":
                     reason = (event.get("data") or {}).get("reason") or {}
             if reason is not None:
                 if reason.get("kind") == "error":

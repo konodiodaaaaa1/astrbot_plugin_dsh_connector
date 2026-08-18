@@ -35,7 +35,7 @@ from urllib.parse import unquote, urlparse
 import aiohttp
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
@@ -62,12 +62,14 @@ except ImportError:  # AstrBot also supports loading a plugin main.py as a modul
 
 HELP_TEXT = """【DeepSeek Harness Connector】
 用法：
+  /dsh help      显示本帮助和全部可用指令
   /dsh <指令>    将指令发送给 DeepSeek Harness 执行并返回结果
   /dsh status    查看连接状态
   /dsh sessions  查看 DSH 会话列表
   /dsh setup     为当前聊天配置选项并创建新会话
   /dsh config [set <字段> <值>|reset]  管理当前聊天的新会话选项
   /dsh session switch <id> | rename <标题> | fork [seq] | search <关键词>
+  /dsh session delete [id]  从 DSH 会话列表删除（需输入 delete 确认）
   /dsh model [服务商/模型] [推理强度]  查看或切换模型
   /dsh providers | global-models  查看 DSH 服务商与全局模型目录
   /dsh effort <值>  设置当前会话推理强度
@@ -167,12 +169,14 @@ class Main(Star):
             return session_id
 
         options = await self._state.load_options(self, chat_key)
-        cwd = options["working_directory"]
-        if not cwd:
+        workspace_id = options.get("workspace_id", "")
+        cwd = options["working_directory"] if not workspace_id else ""
+        if not workspace_id and not cwd:
             cwd = str((await client.describe(http_session)).get("cwd") or "").strip()
         session_id = await client.create_session(
             http_session,
             cwd=cwd,
+            workspace_id=workspace_id,
             agent_preset=options["agent_preset"],
         )
         await self._configure_session_options(client, http_session, session_id, options)
@@ -194,16 +198,21 @@ class Main(Star):
             await client.select_model(http_session, session_id, provider, model, effort)
         permission = options["permission_preset"]
         if permission:
-            await client.prompt(
+            await client.execute_command(
                 http_session,
                 session_id,
                 f"/permission {permission}",
-                client_time_zone=options["client_time_zone"],
             )
 
     # ---------------- 传输实现 ----------------
 
-    async def _run_http(self, event: AstrMessageEvent, text: str, prompt_mode: str = "queue") -> DshReply:
+    async def _run_http(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        prompt_mode: str = "queue",
+        on_chunk=None,
+    ) -> DshReply:
         client = self._make_http_client()
         async with aiohttp.ClientSession() as http_session:
             session_id = await self._session_for_chat(event, client, http_session)
@@ -214,6 +223,7 @@ class Main(Star):
                 text,
                 mode=prompt_mode,
                 client_time_zone=options["client_time_zone"],
+                on_chunk=on_chunk,
             )
 
     async def _run_headless(self, text: str) -> DshReply:
@@ -269,17 +279,62 @@ class Main(Star):
             ) from last_err
         raise DshError(f"启动 dsh 失败：{last_err}") from last_err
 
-    async def _run(self, event: AstrMessageEvent, text: str, prompt_mode: str = "queue") -> DshReply:
+    async def _run(self, event: AstrMessageEvent, text: str, prompt_mode: str = "queue", on_chunk=None) -> DshReply:
         mode = self.mode
         if mode == "headless":
             return await self._run_headless(text)
         try:
-            return await self._run_http(event, text, prompt_mode=prompt_mode)
+            return await self._run_http(event, text, prompt_mode=prompt_mode, on_chunk=on_chunk)
         except DshConnectionError:
             if mode == "auto":
                 logger.info("HTTP 连接失败，回退到 headless 模式执行")
                 return await self._run_headless(text)
             raise
+
+    async def _stream_reply(self, event: AstrMessageEvent, text: str, prompt_mode: str) -> tuple[DshReply, str]:
+        """Forward DSH text deltas to AstrBot while the DSH turn is running."""
+        chunks: asyncio.Queue[str | None] = asyncio.Queue()
+        streamed_parts: list[str] = []
+
+        async def on_chunk(chunk: str) -> None:
+            await chunks.put(chunk)
+
+        task = asyncio.create_task(self._run(event, text, prompt_mode=prompt_mode, on_chunk=on_chunk))
+        task.add_done_callback(lambda _task: chunks.put_nowait(None))
+
+        first_chunk = await chunks.get()
+        if first_chunk is None:
+            return await task, ""
+
+        async def stream():
+            current = first_chunk
+            while current is not None:
+                streamed_parts.append(current)
+                yield MessageChain([Plain(current)])
+                current = await chunks.get()
+
+        await event.send_streaming(stream(), use_fallback=True)
+        return await task, "".join(streamed_parts)
+
+    def _stream_replies_enabled(self) -> bool:
+        """Keep card rendering on the single completed-reply path."""
+        render_mode = normalize_reply_render_mode(self._cfg("reply_render_mode", "text"))
+        return (
+            bool(self._cfg("stream_replies", True))
+            and self.mode != "headless"
+            and render_mode != "card"
+        )
+
+    @staticmethod
+    def _unstreamed_text(reply_text: str, streamed_text: str) -> str:
+        """Keep the terminal reply from repeating text already sent as DSH deltas."""
+        if not streamed_text:
+            return reply_text
+        if reply_text.strip() == streamed_text.strip():
+            return ""
+        if reply_text.startswith(streamed_text):
+            return reply_text[len(streamed_text):].lstrip("\n")
+        return reply_text
 
     async def _download_image(self, source: str) -> str | None:
         """Return a local image path suitable for AstrBot's ``Image`` component."""
@@ -415,6 +470,11 @@ class Main(Star):
             yield event.plain_result(await self._sessions_text())
             return
         if lowered.startswith("session "):
+            session_action = lowered.split(None, 2)[1] if len(lowered.split(None, 2)) > 1 else ""
+            if session_action in {"delete", "del", "remove", "删除"}:
+                async for result in self._delete_session(event, text):
+                    yield result
+                return
             yield event.plain_result(await self._session_command(event, text))
             return
         if lowered.startswith(("history", "历史")):
@@ -467,7 +527,15 @@ class Main(Star):
 
         yield event.plain_result("🤖 已向 DeepSeek Harness 发送指令，正在执行，请稍候…")
         try:
-            reply = await self._run(event, text, prompt_mode=prompt_mode)
+            stream_enabled = self._stream_replies_enabled()
+            if stream_enabled:
+                reply, streamed_text = await self._stream_reply(event, text, prompt_mode)
+                reply = DshReply(
+                    text=self._unstreamed_text(reply.text, streamed_text),
+                    image_sources=reply.image_sources,
+                )
+            else:
+                reply = await self._run(event, text, prompt_mode=prompt_mode)
         except DshTimeout as exc:
             yield event.plain_result(f"⏱️ {exc}")
             return
@@ -481,6 +549,8 @@ class Main(Star):
 
         chain = await self._reply_chain(reply)
         if not chain:
+            if stream_enabled:
+                return
             yield event.plain_result("（DeepSeek Harness 没有返回可呈现的内容）")
             return
         text_parts = [part for part in chain if isinstance(part, Plain)]
@@ -629,16 +699,20 @@ class Main(Star):
     async def _permission_command(self, event: AstrMessageEvent, command: str) -> str:
         parts = command.split(maxsplit=1)
         if len(parts) != 2 or not parts[1].strip():
-            return "用法：/dsh permission <read-only|workspace-write|danger-full-access>"
+            try:
+                await self._require_http()
+                async with aiohttp.ClientSession() as http_session:
+                    presets = await self._make_http_client().permission_presets(http_session)
+                return "可用 DSH 权限预设：" + (", ".join(presets) if presets else "DSH 未报告预设，请直接输入名称")
+            except DshError as exc:
+                return f"❌ {exc}"
         try:
             client, http_session, session_id = await self._active_http_session(event)
             try:
-                options = await self._load_session_options(event)
-                await client.prompt(
+                result = await client.execute_command(
                     http_session,
                     session_id,
                     f"/permission {parts[1].strip()}",
-                    client_time_zone=options["client_time_zone"],
                 )
             finally:
                 await http_session.close()
@@ -647,7 +721,10 @@ class Main(Star):
                 await self._chat_key(event),
                 {"permission_preset": parts[1].strip()},
             )
-            return f"已发送 DSH 权限预设：{parts[1].strip()}"
+            command_result = result.get("result") or {}
+            command_text = str(command_result.get("text") or "").strip()
+            suffix = f"（{command_text}）" if command_text else ""
+            return f"已应用 DSH 权限预设：{parts[1].strip()}{suffix}"
         except DshError as exc:
             return f"❌ {exc}"
 
@@ -718,7 +795,7 @@ class Main(Star):
             cleared = await self._state.clear_options(self, await self._chat_key(event))
             return "已重置当前聊天的新会话选项。\n" + format_session_options(cleared)
         if action not in {"set", "clear", "unset"} or len(parts) < 3:
-            return "用法：/dsh config；/dsh config set <cwd|preset|model|effort|permission|timezone> <值>；/dsh config clear <字段>；/dsh config reset"
+            return "用法：/dsh config；/dsh config set <workspace|cwd|preset|model|effort|permission|timezone> <值>；/dsh config clear <字段>；/dsh config reset"
         field = resolve_option_field(parts[2])
         if not field:
             return f"未知会话选项：{parts[2]}"
@@ -738,6 +815,10 @@ class Main(Star):
             if value and normalized == "UTC" and value.upper() != "UTC":
                 return "时区需要是 UTC 或有效 IANA Area/Location 名称，例如 Asia/Shanghai。"
             changes = {field: normalized}
+        elif field == "workspace_id":
+            changes = {field: value, "working_directory": ""} if value else {field: ""}
+        elif field == "working_directory":
+            changes = {field: value, "workspace_id": ""} if value else {field: ""}
         else:
             changes = {field: value}
         updated = await self._state.update_options(self, await self._chat_key(event), changes)
@@ -751,11 +832,15 @@ class Main(Star):
         normalized = normalize_session_options(options)
         async with aiohttp.ClientSession() as http_session:
             cwd = normalized["working_directory"]
-            if not cwd:
+            workspace_id = normalized.get("workspace_id", "")
+            if workspace_id:
+                cwd = ""
+            elif not cwd:
                 cwd = str((await client.describe(http_session)).get("cwd") or "")
             session_id = await client.create_session(
                 http_session,
                 cwd=cwd,
+                workspace_id=workspace_id,
                 agent_preset=normalized["agent_preset"],
             )
             await self._configure_session_options(
@@ -775,11 +860,15 @@ class Main(Star):
                 host = await client.describe(http_session)
                 presets_value = await client.presets(http_session)
                 models_value = await client.global_models(http_session)
+                workspace_value = await client.workspaces(http_session)
+                permission_presets = await client.permission_presets(http_session)
             wizard = SessionSetupWizard(
                 str(host.get("cwd") or ""),
                 presets_value.get("presets") or [],
                 model_rows(models_value),
                 await self._load_session_options(event),
+                workspace_value.get("items") or [],
+                permission_presets,
             )
         except DshError as exc:
             yield event.plain_result(f"❌ {exc}")
@@ -874,7 +963,7 @@ class Main(Star):
     async def _session_command(self, event: AstrMessageEvent, command: str) -> str:
         parts = command.split(maxsplit=2)
         if len(parts) < 2:
-            return "用法：/dsh session <list|switch|new|rename|fork|search>"
+            return "用法：/dsh session <list|switch|new|rename|fork|search|delete>"
         action = parts[1].lower()
         try:
             await self._require_http()
@@ -917,9 +1006,77 @@ class Main(Star):
                     child = await client.fork_session(http_session, session_id, at_seq)
                     await self._save_session_id(chat_key, child)
                     return f"已从当前会话分叉并绑定：{child}"
-            return "用法：/dsh session <list|switch|new|rename|fork|search>"
+            return "用法：/dsh session <list|switch|new|rename|fork|search|delete>"
         except (DshError, ValueError) as exc:
             return f"❌ {exc}"
+
+    async def _delete_session(self, event: AstrMessageEvent, command: str):
+        """Archive a DSH session after the same explicit confirmation HAPI uses."""
+        parts = command.split(maxsplit=2)
+        target = parts[2].strip() if len(parts) > 2 else ""
+        try:
+            await self._require_http()
+            client = self._make_http_client()
+            chat_key = await self._chat_key(event)
+            bound_session_id = await self._load_session_id(chat_key)
+            async with aiohttp.ClientSession() as http_session:
+                sessions = await client.list_sessions(http_session)
+            wanted = target or bound_session_id or ""
+            if not wanted:
+                yield event.plain_result("当前聊天还没有绑定 DSH 会话。用法：/dsh session delete [sessionId]")
+                return
+            exact = [str(row.get("sessionId")) for row in sessions if str(row.get("sessionId")) == wanted]
+            prefix = [str(row.get("sessionId")) for row in sessions if str(row.get("sessionId", "")).startswith(wanted)]
+            matches = exact or prefix
+            if not matches:
+                yield event.plain_result(f"DSH 中没有会话：{wanted}")
+                return
+            if len(matches) > 1:
+                yield event.plain_result(f"会话 ID 前缀不唯一：{wanted}，请提供完整 ID。")
+                return
+            session_id = matches[0]
+            current = next((row for row in sessions if str(row.get("sessionId")) == session_id), {})
+            is_running = bool(current.get("running"))
+        except DshError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+
+        state = "该会话正在运行，确认后会先取消当前任务，再从 DSH 会话列表移除。" if is_running else "该会话会从 DSH 会话列表移除。"
+        yield event.plain_result(
+            f"{state}\n目标：{session_id}\nDSH 会保留历史日志以支持归档恢复。\n输入 delete 确认，其他任意内容取消："
+        )
+
+        @session_waiter(timeout=30, record_history_chains=False)
+        async def delete_waiter(controller: SessionController, incoming: AstrMessageEvent):
+            reply = (incoming.message_str or "").strip()
+            if not reply:
+                controller.keep(timeout=30, reset_timeout=True)
+                return
+            if reply != "delete":
+                await incoming.send(incoming.plain_result("已取消"))
+                controller.stop()
+                return
+            try:
+                async with aiohttp.ClientSession() as http_session:
+                    if is_running:
+                        await client.cancel(http_session, session_id)
+                    result = await client.archive_session(http_session, session_id)
+                if session_id == bound_session_id:
+                    await self._clear_session_id(chat_key)
+                archived = result.get("archivedSessionIds") or []
+                await incoming.send(incoming.plain_result(
+                    f"DSH 会话已删除：{session_id}\n归档列表已包含该会话：{session_id in archived}"
+                ))
+            except DshError as exc:
+                await incoming.send(incoming.plain_result(f"❌ DSH 删除失败：{exc}"))
+            controller.stop()
+
+        try:
+            await delete_waiter(event)
+        except TimeoutError:
+            yield event.plain_result("删除确认超时，已取消。")
+        finally:
+            event.stop_event()
 
     async def _providers_text(self) -> str:
         try:
@@ -1140,6 +1297,7 @@ class Main(Star):
         event: AstrMessageEvent,
         working_directory: str = "",
         agent_preset: str = "",
+        workspace_id: str = "",
     ):
         """创建并绑定一个新的 DSH 会话。
 
@@ -1157,6 +1315,9 @@ class Main(Star):
                 options["working_directory"] = working_directory.strip()
             if agent_preset.strip():
                 options["agent_preset"] = agent_preset.strip()
+            if workspace_id.strip():
+                options["workspace_id"] = workspace_id.strip()
+                options["working_directory"] = ""
             session_id = await self._create_session_from_options(event, options)
             yield f"已创建并绑定 DSH 会话：{session_id}"
         except DshError as exc:
@@ -1172,7 +1333,7 @@ class Main(Star):
 
     @filter.llm_tool(name="dsh_connector_set_permission")
     async def tool_set_permission(self, event: AstrMessageEvent, preset: str):
-        """设置当前 DSH 会话权限预设，如 read-only、workspace-write、danger-full-access。"""
+        """设置当前 DSH 会话权限预设；可用值由 DSH 主机提供。"""
         if not self._llm_tools_available():
             yield "DSH LLM 工具当前未启用。请在插件配置中设置 enable_llm_tools=true。"
             return

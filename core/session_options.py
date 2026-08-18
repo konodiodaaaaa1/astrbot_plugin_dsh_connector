@@ -9,6 +9,7 @@ from .dsh_client import normalize_client_time_zone
 
 
 OPTION_FIELDS = (
+    "workspace_id",
     "working_directory",
     "agent_preset",
     "provider",
@@ -19,6 +20,8 @@ OPTION_FIELDS = (
 )
 
 FIELD_ALIASES = {
+    "workspace": "workspace_id",
+    "workspace_id": "workspace_id",
     "cwd": "working_directory",
     "directory": "working_directory",
     "preset": "agent_preset",
@@ -33,6 +36,7 @@ FIELD_ALIASES = {
 
 def default_session_options() -> dict[str, str]:
     return {
+        "workspace_id": "",
         "working_directory": "",
         "agent_preset": "",
         "provider": "",
@@ -50,6 +54,8 @@ def normalize_session_options(raw: Any) -> dict[str, str]:
             if field in raw:
                 options[field] = str(raw.get(field) or "").strip()
     options["client_time_zone"] = normalize_client_time_zone(options["client_time_zone"])
+    if options["workspace_id"]:
+        options["working_directory"] = ""
     if not options["provider"] or not options["model"]:
         options["provider"] = ""
         options["model"] = ""
@@ -69,6 +75,7 @@ def format_session_options(options: dict[str, str]) -> str:
     model = f"{value['provider']}/{value['model']}" if value["model"] else "DSH 默认"
     return "\n".join([
         "【当前聊天的 DSH 新会话选项】",
+        f"工作空间：{value['workspace_id'] or '未指定（使用目录）'}",
         f"工作目录：{value['working_directory'] or 'DSH 主机默认'}",
         f"Agent Preset：{value['agent_preset'] or 'DSH 默认'}",
         f"模型：{model}",
@@ -95,15 +102,33 @@ class SessionSetupWizard:
         presets: list[dict[str, Any]],
         models: list[dict[str, Any]],
         initial: dict[str, str] | None = None,
+        workspaces: list[dict[str, Any]] | None = None,
+        permission_presets: list[str] | None = None,
     ) -> None:
         self.host_cwd = host_cwd
         self.presets = [row for row in presets if isinstance(row, dict) and row.get("id")]
         self.models = [row for row in models if isinstance(row, dict) and row.get("provider") and row.get("model")]
+        self.workspaces = [
+            row for row in workspaces or []
+            if isinstance(row, dict) and row.get("workspaceId")
+        ]
+        self.permission_presets = [str(value) for value in permission_presets or [] if str(value).strip()]
         self.options = normalize_session_options(initial or {})
-        self.step = "directory"
+        self.step = "workspace" if self.workspaces else "directory"
         self._efforts: list[str] = []
 
     def initial_prompt(self) -> str:
+        if self.workspaces:
+            lines = [
+                "步骤 1/8 - DSH 工作空间",
+                "  [0] 不指定工作空间，下一步使用目录",
+            ]
+            lines.extend(
+                f"  [{index}] {row.get('title') or row.get('path')} - {row.get('workspaceId')}"
+                for index, row in enumerate(self.workspaces, 1)
+            )
+            lines.append("回复序号或直接输入 workspaceId。")
+            return "\n".join(lines)
         return "\n".join([
             "步骤 1/7 - 工作目录",
             f"DSH 主机目录：{self.host_cwd}",
@@ -113,6 +138,30 @@ class SessionSetupWizard:
     @staticmethod
     def _choice(raw: str, count: int) -> int | None:
         return int(raw) - 1 if raw.isdigit() and 1 <= int(raw) <= count else None
+
+    def _step_workspace(self, value: str) -> SetupResult:
+        index = self._choice(value, len(self.workspaces))
+        if value == "0":
+            self.options["workspace_id"] = ""
+        elif index is not None:
+            self.options["workspace_id"] = str(self.workspaces[index]["workspaceId"])
+        else:
+            wanted = next(
+                (str(row["workspaceId"]) for row in self.workspaces if str(row["workspaceId"]) == value),
+                "",
+            )
+            if not wanted:
+                return SetupResult("请输入工作空间序号、0，或有效 workspaceId。")
+            self.options["workspace_id"] = wanted
+        if self.options["workspace_id"]:
+            self.options["working_directory"] = ""
+        self.step = "directory"
+        return SetupResult(
+            "步骤 2/8 - 工作目录\n"
+            "已选择工作空间时回复 0 保留该分配；输入目录会改用目录创建会话。\n"
+            f"DSH 主机目录：{self.host_cwd}\n"
+            "直接输入目录；回复 0 使用当前工作空间或主机默认。"
+        )
 
     def process(self, raw: str) -> SetupResult:
         value = str(raw or "").strip()
@@ -124,9 +173,13 @@ class SessionSetupWizard:
     def _step_directory(self, value: str) -> SetupResult:
         if not value:
             return SetupResult("目录为空，请输入目录或回复 0。")
-        self.options["working_directory"] = "" if value == "0" else value
+        if value == "0":
+            self.options["working_directory"] = ""
+        else:
+            self.options["working_directory"] = value
+            self.options["workspace_id"] = ""
         self.step = "preset"
-        lines = ["步骤 2/7 - Agent Preset", "  [0] DSH 默认"]
+        lines = [f"步骤 {'3/8' if self.workspaces else '2/7'} - Agent Preset", "  [0] DSH 默认"]
         lines.extend(f"  [{index}] {row['id']} - {row.get('name') or row.get('description') or ''}" for index, row in enumerate(self.presets, 1))
         lines.append("回复序号或直接输入 Preset ID。")
         return SetupResult("\n".join(lines))
@@ -135,7 +188,7 @@ class SessionSetupWizard:
         index = self._choice(value, len(self.presets))
         self.options["agent_preset"] = "" if value == "0" else str(self.presets[index]["id"] if index is not None else value)
         self.step = "model"
-        lines = ["步骤 3/7 - 模型", "  [0] DSH 默认"]
+        lines = [f"步骤 {'4/8' if self.workspaces else '3/7'} - 模型", "  [0] DSH 默认"]
         lines.extend(f"  [{index}] {row['provider']}/{row['model']}" for index, row in enumerate(self.models, 1))
         lines.append("回复序号或直接输入 provider/model。")
         return SetupResult("\n".join(lines))
@@ -156,7 +209,7 @@ class SessionSetupWizard:
             self.options["model"] = str(row["model"])
             self._efforts = [str(item) for item in row.get("efforts") or []]
         self.step = "effort"
-        lines = ["步骤 4/7 - 推理强度", "  [0] 模型默认"]
+        lines = [f"步骤 {'5/8' if self.workspaces else '4/7'} - 推理强度", "  [0] 模型默认"]
         lines.extend(f"  [{index}] {effort}" for index, effort in enumerate(self._efforts, 1))
         lines.append("回复序号或直接输入推理强度。")
         return SetupResult("\n".join(lines))
@@ -165,22 +218,25 @@ class SessionSetupWizard:
         index = self._choice(value, len(self._efforts))
         self.options["reasoning_effort"] = "" if value == "0" else str(self._efforts[index] if index is not None else value)
         self.step = "permission"
-        return SetupResult("\n".join([
-            "步骤 5/7 - 权限",
+        lines = [
+            f"步骤 {'6/8' if self.workspaces else '5/7'} - 权限",
             "  [0] DSH 默认",
-            "  [1] read-only",
-            "  [2] workspace-write",
-            "  [3] danger-full-access",
-            "回复序号或直接输入权限预设。",
-        ]))
+        ]
+        if self.permission_presets:
+            lines.extend(f"  [{index}] {preset}" for index, preset in enumerate(self.permission_presets, 1))
+        else:
+            lines.append("DSH 未报告权限预设；可直接输入权限名称。")
+        lines.append("回复序号、0，或直接输入权限预设。")
+        return SetupResult("\n".join(lines))
 
     def _step_permission(self, value: str) -> SetupResult:
-        presets = ["read-only", "workspace-write", "danger-full-access"]
-        index = self._choice(value, len(presets))
-        self.options["permission_preset"] = "" if value == "0" else str(presets[index] if index is not None else value)
+        index = self._choice(value, len(self.permission_presets))
+        self.options["permission_preset"] = "" if value == "0" else str(
+            self.permission_presets[index] if index is not None else value
+        )
         self.step = "timezone"
         return SetupResult("\n".join([
-            "步骤 6/7 - 客户端时区",
+            f"步骤 {'7/8' if self.workspaces else '6/7'} - 客户端时区",
             "  [1] Asia/Shanghai",
             "  [2] UTC",
             "也可直接输入有效 IANA Area/Location 名称。",
@@ -193,7 +249,8 @@ class SessionSetupWizard:
             return SetupResult("时区无效，请输入 Asia/Shanghai、UTC 或有效 IANA Area/Location。")
         self.options["client_time_zone"] = normalized
         self.step = "confirm"
-        return SetupResult(format_session_options(self.options) + "\n\n步骤 7/7 - 回复 y 创建并绑定新会话，其他输入取消。")
+        final_step = "8/8" if self.workspaces else "7/7"
+        return SetupResult(format_session_options(self.options) + f"\n\n步骤 {final_step} - 回复 y 创建并绑定新会话，其他输入取消。")
 
     def _step_confirm(self, value: str) -> SetupResult:
         if value.lower() != "y":
