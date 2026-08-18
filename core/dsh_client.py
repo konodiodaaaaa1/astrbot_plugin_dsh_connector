@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import time
 import uuid
-from typing import Any, Awaitable, Callable
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
@@ -410,7 +409,6 @@ class DshHttpClient:
         text: str,
         mode: str = "queue",
         client_time_zone: str = "",
-        on_chunk: Callable[[str], Awaitable[None] | None] | None = None,
     ) -> DshReply:
         if mode == "queue":
             await self._wait_idle(session, session_id)
@@ -422,7 +420,7 @@ class DshHttpClient:
             mode=mode,
             client_time_zone=client_time_zone,
         )
-        return await self._await_reply(session, session_id, baseline, on_chunk=on_chunk)
+        return await self._await_reply(session, session_id, baseline)
 
     async def _last_seq(self, session: aiohttp.ClientSession, session_id: str) -> int:
         events = await self.history(session, session_id, max_messages=5)
@@ -443,11 +441,9 @@ class DshHttpClient:
         session: aiohttp.ClientSession,
         session_id: str,
         baseline: int,
-        on_chunk: Callable[[str], Awaitable[None] | None] | None = None,
     ) -> DshReply:
         deadline = time.monotonic() + self.timeout
         last_reply = DshReply()
-        emitted_chunk_sequences: set[int] = set()
         while time.monotonic() < deadline:
             events = await self.history(session, session_id, max_messages=100)
             reason = None
@@ -456,21 +452,7 @@ class DshHttpClient:
                 if not event or event_seq(event) <= baseline:
                     continue
                 event_type = event.get("type")
-                if event_type == "assistant/chunk":
-                    sequence = event_seq(event)
-                    chunk = (event.get("data") or {}).get("chunk") or {}
-                    chunk_text = chunk.get("text") if chunk.get("type") == "text-delta" else None
-                    if (
-                        on_chunk is not None
-                        and sequence not in emitted_chunk_sequences
-                        and isinstance(chunk_text, str)
-                        and chunk_text
-                    ):
-                        emitted_chunk_sequences.add(sequence)
-                        callback_result = on_chunk(chunk_text)
-                        if inspect.isawaitable(callback_result):
-                            await callback_result
-                elif event_type == "assistant/message":
+                if event_type == "assistant/message":
                     # DSH emits one finalized assistant message per provider/tool
                     # step. The last finalized message is the turn result; earlier
                     # messages are intermediate step output and must not be folded

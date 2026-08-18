@@ -11,6 +11,7 @@ _RICH_MARKDOWN = re.compile(
     re.MULTILINE,
 )
 _FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+DEFAULT_MESSAGE_MAX_CHARS = 4200
 
 
 def normalize_reply_render_mode(value: object) -> str:
@@ -67,3 +68,34 @@ def split_markdown_for_cards(markdown: str, maximum_chars: int) -> list[str]:
             buffer = buffer.rstrip() + "\n" + close_fence
         chunks.append(buffer.strip())
     return chunks
+
+
+def split_text_for_message(text: str, maximum_chars: int = DEFAULT_MESSAGE_MAX_CHARS) -> list[str]:
+    """Split long plain text on line boundaries for platform message limits."""
+    value = str(text or "")
+    limit = max(1, int(maximum_chars or DEFAULT_MESSAGE_MAX_CHARS))
+    if len(value) <= limit:
+        return [value]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_length = 0
+    for line in value.splitlines():
+        if len(line) > limit:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_length = 0
+            chunks.extend(line[index : index + limit] for index in range(0, len(line), limit))
+            continue
+        extra = len(line) if not current else len(line) + 1
+        if current and current_length + extra > limit:
+            chunks.append("\n".join(current))
+            current = []
+            current_length = 0
+        current.append(line)
+        current_length += len(line) if len(current) == 1 else len(line) + 1
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [value[index : index + limit] for index in range(0, len(value), limit)]

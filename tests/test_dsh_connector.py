@@ -8,7 +8,7 @@ from core.config_service import dotted_path, namespace_map, parse_json_value, re
 from core.dsh_client import DshHttpClient, normalize_client_time_zone
 from core.session_options import SessionSetupWizard, format_session_options, normalize_session_options
 from core.session_state import SessionState
-from core.reply_render import should_render_card, split_markdown_for_cards
+from core.reply_render import should_render_card, split_markdown_for_cards, split_text_for_message
 from dsh_connector_helpers import DshReply, assistant_reply, merge_replies, model_rows
 
 
@@ -146,6 +146,13 @@ class DshConnectorHelperTests(unittest.TestCase):
         self.assertTrue(should_render_card("auto", "```python\nprint('ok')\n```", 120))
         self.assertFalse(should_render_card("text", markdown, 1))
 
+    def test_message_split_uses_line_boundaries_and_fixed_limit(self):
+        text = "\n".join(f"line-{index}" for index in range(900))
+        chunks = split_text_for_message(text, 100)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= 100 for chunk in chunks))
+        self.assertEqual("\n".join(chunks), text)
+
 
 class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
     async def test_execute_command_uses_typert_remote_wire(self):
@@ -226,7 +233,7 @@ class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
         await client.archive_session(None, "session-a")
         self.assertEqual(client.calls, [("workspace.archiveSession", {"sessionId": "session-a"})])
 
-    async def test_history_streams_each_new_text_delta_once(self):
+    async def test_history_waits_for_final_message_after_text_deltas(self):
         chunk_one = {"event": {"seq": 1, "type": "assistant/chunk", "data": {
             "chunk": {"type": "text-delta", "text": "hel"},
         }}}
@@ -249,9 +256,7 @@ class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
                 self.round += 1
                 return [chunk_one] if self.round == 1 else [chunk_one, chunk_two, message, end]
 
-        streamed = []
-        reply = await StreamingClient()._await_reply(None, "session-a", 0, on_chunk=streamed.append)
-        self.assertEqual(streamed, ["hel", "lo"])
+        reply = await StreamingClient()._await_reply(None, "session-a", 0)
         self.assertEqual(reply.text, "hello")
 
     async def test_history_returns_only_last_assistant_message_from_multi_step_turn(self):
@@ -373,58 +378,97 @@ class DshSessionStateTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DshConnectorImageTests(unittest.IsolatedAsyncioTestCase):
-    async def test_card_mode_uses_only_completed_reply_path(self):
-        from main import Main
-
-        plugin = object.__new__(Main)
-        plugin.config = {
-            "mode": "http",
-            "stream_replies": True,
-            "reply_render_mode": "card",
-        }
-        self.assertFalse(plugin._stream_replies_enabled())
-
-        plugin.config["reply_render_mode"] = "text"
-        self.assertTrue(plugin._stream_replies_enabled())
-
-    async def test_stream_reply_forwards_dsh_chunks_to_astrbot(self):
+    async def test_completed_reply_is_sent_as_one_message_chain(self):
         from main import Main
         from astrbot.api.message_components import Plain
 
         plugin = object.__new__(Main)
+        plugin.config = {
+            "max_reply_chars": 0,
+            "max_images_per_reply": 0,
+            "reply_render_mode": "text",
+        }
 
-        async def run(_event, _text, prompt_mode="queue", on_chunk=None):
-            await on_chunk("hello ")
-            await on_chunk("world")
-            return DshReply(text="hello world")
+        async def run(_event, _text, prompt_mode="queue"):
+            return DshReply(text="paragraph one\n\nparagraph two")
 
         plugin._run = run
 
         class Event:
             def __init__(self):
-                self.chunks = []
+                self.message_str = "dsh prompt"
+                self.results = []
 
-            async def send_streaming(self, generator, use_fallback=False):
-                self.assertTrue(use_fallback)
-                async for chain in generator:
-                    self.chunks.extend(part.text for part in chain.chain if isinstance(part, Plain))
+            def plain_result(self, text):
+                result = ("plain", text)
+                self.results.append(result)
+                return result
 
-            def assertTrue(self, value):
-                if not value:
-                    raise AssertionError("expected true")
+            def chain_result(self, chain):
+                result = ("chain", chain)
+                self.results.append(result)
+                return result
 
         event = Event()
-        reply, streamed = await plugin._stream_reply(event, "prompt", "queue")
-        self.assertEqual(event.chunks, ["hello ", "world"])
-        self.assertEqual(streamed, "hello world")
-        self.assertEqual(reply.text, "hello world")
+        results = [result async for result in plugin.dsh(event)]
+        self.assertEqual([kind for kind, _value in results], ["plain", "chain"])
+        self.assertEqual(len(event.results[1][1]), 1)
+        self.assertIsInstance(event.results[1][1][0], Plain)
+        self.assertIn("paragraph one", event.results[1][1][0].text)
 
-    async def test_streamed_final_text_is_not_sent_twice(self):
+    async def test_qq_adapter_sends_long_reply_in_ordered_private_messages(self):
+        from unittest.mock import AsyncMock
+
         from main import Main
+        from astrbot.api.message_components import Plain
+        from astrbot.core.message.message_event_result import MessageChain
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
-        self.assertEqual(Main._unstreamed_text("hello", "hello"), "")
-        self.assertEqual(Main._unstreamed_text("hello\nnext", "hello"), "next")
-        self.assertEqual(Main._unstreamed_text("final", "partial"), "final")
+        plugin = object.__new__(Main)
+        plugin.config = {
+            "max_reply_chars": 0,
+            "max_images_per_reply": 0,
+            "reply_render_mode": "text",
+        }
+        expected_text = "我要复活: 08-18 15:53:16\n\n" + "正文段落。\n" * 1500
+
+        async def run(_event, _text, prompt_mode="queue"):
+            return DshReply(text=expected_text)
+
+        plugin._run = run
+
+        class Event:
+            message_str = "dsh prompt"
+
+            def plain_result(self, text):
+                return ("plain", text)
+
+            def chain_result(self, chain):
+                return ("chain", chain)
+
+        results = [result async for result in plugin.dsh(Event())]
+        chains = [value for kind, value in results if kind == "chain"]
+        self.assertGreater(len(chains), 1)
+        self.assertTrue(all(len(chain) == 1 and isinstance(chain[0], Plain) for chain in chains))
+
+        bot = AsyncMock()
+        for chain in chains:
+            await AiocqhttpMessageEvent.send_message(
+                bot=bot,
+                message_chain=MessageChain(chain),
+                event=None,
+                is_group=False,
+                session_id="987654",
+            )
+        self.assertEqual(bot.send_private_msg.await_count, len(chains))
+        payload_texts = []
+        for call in bot.send_private_msg.await_args_list:
+            payload = call.kwargs["message"]
+            self.assertEqual(len(payload), 1)
+            self.assertEqual(payload[0]["type"], "text")
+            self.assertLessEqual(len(payload[0]["data"]["text"]), 4200)
+            payload_texts.append(payload[0]["data"]["text"])
+        self.assertEqual("\n".join(payload_texts), expected_text.rstrip("\n"))
 
     async def test_card_mode_uses_astrbot_t2i_and_keeps_image_component(self):
         from main import Main

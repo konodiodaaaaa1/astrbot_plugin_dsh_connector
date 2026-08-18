@@ -35,7 +35,7 @@ from urllib.parse import unquote, urlparse
 import aiohttp
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
@@ -50,7 +50,7 @@ try:
     from .core.session_options import (
         SessionSetupWizard, format_session_options, normalize_session_options, resolve_option_field,
     )
-    from .core.reply_render import normalize_reply_render_mode, should_render_card, split_markdown_for_cards
+    from .core.reply_render import normalize_reply_render_mode, should_render_card, split_markdown_for_cards, split_text_for_message
 except ImportError:  # AstrBot also supports loading a plugin main.py as a module.
     from dsh_connector_helpers import DshReply, merge_replies, model_rows
     from core.dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout, normalize_client_time_zone
@@ -58,7 +58,7 @@ except ImportError:  # AstrBot also supports loading a plugin main.py as a modul
     from core.presentation import current_goal, projection_values, session_label
     from core.session_state import SessionState
     from core.session_options import SessionSetupWizard, format_session_options, normalize_session_options, resolve_option_field
-    from core.reply_render import normalize_reply_render_mode, should_render_card, split_markdown_for_cards
+    from core.reply_render import normalize_reply_render_mode, should_render_card, split_markdown_for_cards, split_text_for_message
 
 HELP_TEXT = """【DeepSeek Harness Connector】
 用法：
@@ -89,13 +89,6 @@ HELP_TEXT = """【DeepSeek Harness Connector】
   /dsh 帮我写一段 Python 快速排序代码
   /dsh 总结一下我桌面上的 todo.txt
 """
-
-
-def _chunk_text(text: str, size: int) -> list:
-    """把长文本切成若干片，便于发送（size<=0 表示不切分）。"""
-    if not size or size <= 0 or len(text) <= size:
-        return [text]
-    return [text[i : i + size] for i in range(0, len(text), size)]
 
 
 class Main(Star):
@@ -211,7 +204,6 @@ class Main(Star):
         event: AstrMessageEvent,
         text: str,
         prompt_mode: str = "queue",
-        on_chunk=None,
     ) -> DshReply:
         client = self._make_http_client()
         async with aiohttp.ClientSession() as http_session:
@@ -223,7 +215,6 @@ class Main(Star):
                 text,
                 mode=prompt_mode,
                 client_time_zone=options["client_time_zone"],
-                on_chunk=on_chunk,
             )
 
     async def _run_headless(self, text: str) -> DshReply:
@@ -279,62 +270,17 @@ class Main(Star):
             ) from last_err
         raise DshError(f"启动 dsh 失败：{last_err}") from last_err
 
-    async def _run(self, event: AstrMessageEvent, text: str, prompt_mode: str = "queue", on_chunk=None) -> DshReply:
+    async def _run(self, event: AstrMessageEvent, text: str, prompt_mode: str = "queue") -> DshReply:
         mode = self.mode
         if mode == "headless":
             return await self._run_headless(text)
         try:
-            return await self._run_http(event, text, prompt_mode=prompt_mode, on_chunk=on_chunk)
+            return await self._run_http(event, text, prompt_mode=prompt_mode)
         except DshConnectionError:
             if mode == "auto":
                 logger.info("HTTP 连接失败，回退到 headless 模式执行")
                 return await self._run_headless(text)
             raise
-
-    async def _stream_reply(self, event: AstrMessageEvent, text: str, prompt_mode: str) -> tuple[DshReply, str]:
-        """Forward DSH text deltas to AstrBot while the DSH turn is running."""
-        chunks: asyncio.Queue[str | None] = asyncio.Queue()
-        streamed_parts: list[str] = []
-
-        async def on_chunk(chunk: str) -> None:
-            await chunks.put(chunk)
-
-        task = asyncio.create_task(self._run(event, text, prompt_mode=prompt_mode, on_chunk=on_chunk))
-        task.add_done_callback(lambda _task: chunks.put_nowait(None))
-
-        first_chunk = await chunks.get()
-        if first_chunk is None:
-            return await task, ""
-
-        async def stream():
-            current = first_chunk
-            while current is not None:
-                streamed_parts.append(current)
-                yield MessageChain([Plain(current)])
-                current = await chunks.get()
-
-        await event.send_streaming(stream(), use_fallback=True)
-        return await task, "".join(streamed_parts)
-
-    def _stream_replies_enabled(self) -> bool:
-        """Keep card rendering on the single completed-reply path."""
-        render_mode = normalize_reply_render_mode(self._cfg("reply_render_mode", "text"))
-        return (
-            bool(self._cfg("stream_replies", True))
-            and self.mode != "headless"
-            and render_mode != "card"
-        )
-
-    @staticmethod
-    def _unstreamed_text(reply_text: str, streamed_text: str) -> str:
-        """Keep the terminal reply from repeating text already sent as DSH deltas."""
-        if not streamed_text:
-            return reply_text
-        if reply_text.strip() == streamed_text.strip():
-            return ""
-        if reply_text.startswith(streamed_text):
-            return reply_text[len(streamed_text):].lstrip("\n")
-        return reply_text
 
     async def _download_image(self, source: str) -> str | None:
         """Return a local image path suitable for AstrBot's ``Image`` component."""
@@ -433,6 +379,22 @@ class Main(Star):
                 components.append(Image(file=image_path))
         return components
 
+    def _reply_chains(self, chain: list) -> list[list]:
+        """Build ordered platform messages, splitting only overlong plain text."""
+        text_parts = [part for part in chain if isinstance(part, Plain)]
+        if not text_parts:
+            return [chain]
+        text = "\n".join(part.text for part in text_parts)
+        chunks = split_text_for_message(text)
+        if len(chunks) == 1:
+            return [chain]
+
+        messages = [[Plain(chunk)] for chunk in chunks]
+        images = [part for part in chain if isinstance(part, Image)]
+        if images:
+            messages.append(images)
+        return messages
+
     # ---------------- 指令处理 ----------------
 
     @filter.command("dsh", alias={"ds"})
@@ -527,15 +489,7 @@ class Main(Star):
 
         yield event.plain_result("🤖 已向 DeepSeek Harness 发送指令，正在执行，请稍候…")
         try:
-            stream_enabled = self._stream_replies_enabled()
-            if stream_enabled:
-                reply, streamed_text = await self._stream_reply(event, text, prompt_mode)
-                reply = DshReply(
-                    text=self._unstreamed_text(reply.text, streamed_text),
-                    image_sources=reply.image_sources,
-                )
-            else:
-                reply = await self._run(event, text, prompt_mode=prompt_mode)
+            reply = await self._run(event, text, prompt_mode=prompt_mode)
         except DshTimeout as exc:
             yield event.plain_result(f"⏱️ {exc}")
             return
@@ -549,17 +503,12 @@ class Main(Star):
 
         chain = await self._reply_chain(reply)
         if not chain:
-            if stream_enabled:
-                return
             yield event.plain_result("（DeepSeek Harness 没有返回可呈现的内容）")
             return
-        text_parts = [part for part in chain if isinstance(part, Plain)]
-        image_parts = [part for part in chain if isinstance(part, Image)]
-        for part in text_parts:
-            for chunk in _chunk_text(part.text, int(self._cfg("reply_chunk_size", 2000) or 0)):
-                yield event.plain_result(chunk)
-        if image_parts:
-            yield event.chain_result(image_parts)
+        # Send completed text as ordered chains; only platform-overlong text
+        # is split, so DSH deltas never become separate QQ messages.
+        for message_chain in self._reply_chains(chain):
+            yield event.chain_result(message_chain)
 
     async def _status_text(self) -> str:
         lines = ["【DeepSeek Harness 桥接状态】", f"模式：{self.mode}"]

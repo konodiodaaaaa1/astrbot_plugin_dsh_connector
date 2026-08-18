@@ -131,7 +131,7 @@ dsh web --port 3080
 
 ## 实时回复
 
-HTTP/auto 模式默认读取 DSH `assistant/chunk` 的 `text-delta` 并交给 AstrBot `send_streaming`。QQ 官方私聊和 Telegram 会实时更新回复，aiocqhttp 会按句子分段发送。通过插件配置中的 `stream_replies` 可关闭实时模式；卡片、DSH attachment 与其他图片仍会在任务完成后继续发送。
+HTTP/auto 模式等待 DSH turn 完成后，将最终文本、卡片和图片组件组成消息链发送。普通长度回复保持一条消息；超过 QQ 单条消息限制时按换行边界有序切片。卡片、DSH attachment 与其他图片仍会在任务完成后继续发送。
 
 ## LLM 工具
 
