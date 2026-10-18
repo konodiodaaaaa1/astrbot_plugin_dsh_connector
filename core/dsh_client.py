@@ -1,11 +1,27 @@
-"""Typed convenience client for the DSH Web RPC surface."""
+"""Typed convenience client for the DSH 0.2+ Web RPC surface.
+
+DSH 0.2 replaced the dotted RPC names with a Typert gateway whose endpoints are
+``<namespace>/<method>`` and whose payload is ``{"args": {...}}``.  Every
+``/api`` request also carries the signed browser-session cookie that the Web
+transport mints during its root token exchange.  The cookie can be derived
+locally from the ``client-connection/browser-session`` signing secret stored in
+``$DSH_HOME/.credentials.yaml``, which keeps this connector restart-proof
+without asking the operator to copy the per-process launch token.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
+import json
+import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
@@ -33,6 +49,14 @@ WINDOWS_TIME_ZONE_MAP = {
     "China Standard Time": "Asia/Shanghai",
 }
 
+DSH_HOME_ENV = "DSH_HOME"
+CREDENTIALS_FILENAME = ".credentials.yaml"
+WORKSPACE_STORAGE = ("storages", "workspace.json")
+BROWSER_SESSION_RECORD = "client-connection/browser-session"
+AUTH_COOKIE_PREFIX = "dsh-auth-"
+AUTH_COOKIE_VERSION = 1
+AUTH_COOKIE_TTL_MS = 60 * 60 * 1000
+
 
 def normalize_client_time_zone(value: str = "") -> str:
     """Return the IANA/UTC identifier accepted by DSH's prompt endpoint."""
@@ -49,32 +73,161 @@ def normalize_client_time_zone(value: str = "") -> str:
     return candidate
 
 
-class DshHttpClient:
-    """Client for the DSH ``/api/<rpc-method>`` JSON transport."""
+def resolve_dsh_home(explicit: str = "") -> Path:
+    """Resolve the DSH home directory from config, environment, or default."""
+    candidate = str(explicit or "").strip()
+    if not candidate:
+        candidate = str(os.environ.get(DSH_HOME_ENV) or "").strip()
+    return Path(candidate).expanduser() if candidate else Path.home() / ".dsh"
 
-    def __init__(self, base_url: str, timeout: float, poll_interval: float) -> None:
+
+def _base64url(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii").replace("+", "-").replace("/", "_").rstrip("=")
+
+
+def _decode_base64url(value: str) -> bytes | None:
+    text = str(value or "").strip()
+    if not text or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for character in text):
+        return None
+    padded = text + "=" * ((4 - len(text) % 4) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except (ValueError, TypeError):
+        return None
+    return decoded if _base64url(decoded) == text else None
+
+
+def _indent_width(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def extract_browser_session_secret(text: str) -> bytes | None:
+    """Read ``client-connection/browser-session``'s secret from the YAML text.
+
+    The credentials file is a flat mapping of record keys to small YAML blocks;
+    scanning the one record keeps the connector free of a PyYAML dependency.
+    """
+    lines = str(text or "").splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != BROWSER_SESSION_RECORD + ":":
+            continue
+        record_indent = _indent_width(line)
+        for follow in lines[index + 1:]:
+            stripped = follow.strip()
+            if stripped and _indent_width(follow) <= record_indent:
+                break
+            if stripped.startswith("secret:"):
+                raw = stripped.partition(":")[2].strip().strip("'\"")
+                return _decode_base64url(raw) if raw else None
+    return None
+
+
+def load_browser_session_secret(home: Path) -> bytes:
+    """Load the cookie-signing secret DSH persists for its Web profile."""
+    path = Path(home) / CREDENTIALS_FILENAME
+    if not path.is_file():
+        raise DshError(
+            f"未找到 DSH 浏览器会话凭据：{path}。请把插件配置 dsh_home（或环境变量 DSH_HOME）"
+            "指向正在运行的 DSH 主目录（默认 %USERPROFILE%\\.dsh），并先运行一次 dsh web。"
+        )
+    try:
+        text = path.read_text("utf-8")
+    except OSError as exc:
+        raise DshError(f"读取 DSH 凭据失败：{path}：{exc}") from exc
+    secret = extract_browser_session_secret(text)
+    if secret is None:
+        raise DshError(
+            f"DSH 凭据文件里没有 {BROWSER_SESSION_RECORD} 记录：{path}。"
+            "请重启 dsh web 让该进程生成浏览器会话密钥。"
+        )
+    return secret
+
+
+def build_auth_cookie(secret: bytes, authority: str, ttl_ms: int = AUTH_COOKIE_TTL_MS) -> str:
+    """Build the signed ``dsh-auth-<authority hash>`` cookie for one request."""
+    name = AUTH_COOKIE_PREFIX + _base64url(hashlib.sha256(authority.encode("utf-8")).digest())
+    now = int(time.time() * 1000)
+    payload = {
+        "version": AUTH_COOKIE_VERSION,
+        "authority": authority,
+        "issuedAt": now,
+        "expiresAt": now + int(ttl_ms),
+    }
+    body = _base64url(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    signature = _base64url(hmac.new(secret, body.encode("ascii"), hashlib.sha256).digest())
+    return f"{name}=v1.{body}.{signature}"
+
+
+class DshHttpClient:
+    """Client for the DSH 0.2+ ``/api/<namespace>/<method>`` JSON transport."""
+
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float,
+        poll_interval: float,
+        dsh_home: str = "",
+        default_cwd: str = "",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.poll_interval = poll_interval
+        self.dsh_home = resolve_dsh_home(dsh_home)
+        self.default_cwd_hint = str(default_cwd or "").strip()
+        self.authority = urlparse(self.base_url).netloc or self.base_url
+        self._secret: bytes | None = None
+        self._secret_error: str | None = None
 
-    async def rpc(self, session: aiohttp.ClientSession, method: str, payload: dict[str, Any]) -> Any:
+    # ---------------- 传输与认证 ----------------
+
+    def _auth_cookie(self) -> str:
+        if self._secret is None:
+            if self._secret_error is not None:
+                raise DshError(self._secret_error)
+            try:
+                self._secret = load_browser_session_secret(self.dsh_home)
+            except DshError as exc:
+                self._secret_error = str(exc)
+                raise
+        return build_auth_cookie(self._secret, self.authority)
+
+    @staticmethod
+    def _http_error(method: str, status: int, body: str) -> DshError:
+        if status == 401:
+            return DshError(
+                "DSH 拒绝请求（401）：缺少浏览器会话凭据。请确认 dsh_home 指向正在运行的 DSH 的 "
+                "DSH_HOME（默认 ~/.dsh），且其中存在 .credentials.yaml。"
+            )
+        if status == 403:
+            return DshError(
+                "DSH 拒绝请求（403）：Host/Origin 校验失败。请把 http_base_url 设为 "
+                "http://127.0.0.1:<端口> 这类回环地址。"
+            )
+        if status == 404:
+            return DshError(
+                f"DSH 不支持接口 {method}（404）。请确认 DSH 版本为 0.2 及以上，且接口名没有被改动。"
+            )
+        return DshError(f"DSH 返回 HTTP {status}: {body[:300]}")
+
+    async def rpc(self, session: aiohttp.ClientSession, method: str, args: dict[str, Any] | None = None) -> Any:
         envelope = {
             "type": "client-request",
             "rpcId": str(uuid.uuid4()),
             "method": method,
-            "payload": payload,
+            "payload": {"args": dict(args or {})},
         }
         url = f"{self.base_url}/api/{method}"
+        headers = {"content-type": "application/json", "cookie": self._auth_cookie()}
         try:
             async with session.post(
                 url,
                 json=envelope,
-                headers={"content-type": "application/json"},
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=self.timeout),
             ) as response:
                 if response.status != 200:
                     body = await response.text()
-                    raise DshError(f"DSH 返回 HTTP {response.status}: {body[:300]}")
+                    raise self._http_error(method, response.status, body)
                 data = await response.json()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise DshConnectionError(f"连接 DeepSeek Harness 失败（{url}）：{exc}") from exc
@@ -95,41 +248,12 @@ class DshHttpClient:
         session_id: str,
         line: str,
     ) -> dict[str, Any]:
-        """Execute a DSH host command through the Typert remote surface.
-
-        Commands use the slash-separated remote endpoint and put lookup/json
-        arguments under ``payload.args``. This is distinct from
-        ``session.prompt``: command output is handled by DSH directly and the
-        command lifecycle is persisted as DSH command events.
-        """
-        envelope = {
-            "type": "client-request",
-            "rpcId": str(uuid.uuid4()),
-            "method": "commands/execute",
-            "payload": {"args": {"agentId": session_id, "line": line}},
-        }
-        url = f"{self.base_url}/api/commands/execute"
-        try:
-            async with session.post(
-                url,
-                json=envelope,
-                headers={"content-type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
-            ) as response:
-                if response.status != 200:
-                    body = await response.text()
-                    raise DshError(f"DSH 返回 HTTP {response.status}: {body[:300]}")
-                data = await response.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise DshConnectionError(f"连接 DeepSeek Harness 失败（{url}）：{exc}") from exc
-
-        if not isinstance(data, dict) or data.get("type") != "server-response":
-            raise DshError(f"DSH 返回了意外响应：{str(data)[:300]}")
-        result = data.get("result") or {}
-        if not result.get("ok"):
-            error = result.get("error") or {}
-            raise DshError(f"DSH 错误 {error.get('code')}: {error.get('message')}")
-        value = result.get("value")
+        """Execute one DSH host slash command for an Agent."""
+        value = await self.rpc(
+            session,
+            "commands/execute",
+            {"agentId": session_id, "line": line, "submittedAttachments": []},
+        )
         if not isinstance(value, dict):
             raise DshError("DSH 命令返回了意外结果")
         command_result = value.get("result") or {}
@@ -137,15 +261,69 @@ class DshHttpClient:
             raise DshError(str(command_result.get("text") or "DSH 命令执行失败"))
         return value
 
+    # ---------------- 主机描述 ----------------
+
     async def describe(self, session: aiohttp.ClientSession) -> dict[str, Any]:
-        return await self.rpc(session, "host.describe", {})
+        """Describe the host from the settings document and local DSH state."""
+        description = await self.settings(session)
+        default_model: dict[str, Any] = {}
+        for row in description.get("namespaces") or []:
+            if isinstance(row, dict) and row.get("ns") == "agent-default-model":
+                default_model = row.get("value") or {}
+                break
+        return {
+            "cwd": self.default_cwd(),
+            "home": str(self.dsh_home),
+            "provider": default_model.get("provider") or "?",
+            "model": default_model.get("model") or "?",
+            "reasoningEffort": default_model.get("reasoningEffort") or "",
+            "version": "0.2+ (Typert)",
+        }
+
+    def default_cwd(self) -> str:
+        if self.default_cwd_hint:
+            return self.default_cwd_hint
+        for item in self.workspace_items():
+            path = str(item.get("path") or "").strip()
+            if path:
+                return path
+        return str(Path.home())
+
+    def workspace_items(self) -> list[dict[str, Any]]:
+        """Read the Workspace registry DSH persists for its Web sidebar."""
+        path = self.dsh_home.joinpath(*WORKSPACE_STORAGE)
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(raw, dict):
+            return []
+        tables = ((raw.get("tables") or {}).get("workspaces") or {})
+        if not isinstance(tables, dict):
+            return []
+        order = ((raw.get("global") or {}).get("workspaceIds") or [])
+        items: list[dict[str, Any]] = []
+        for workspace_id in order:
+            row = tables.get(workspace_id)
+            if isinstance(row, dict):
+                items.append({"workspaceId": workspace_id, **row})
+        for workspace_id, row in tables.items():
+            if workspace_id not in order and isinstance(row, dict):
+                items.append({"workspaceId": workspace_id, **row})
+        return items
+
+    async def workspaces(self, _session: aiohttp.ClientSession | None = None) -> dict[str, Any]:
+        return {"items": self.workspace_items()}
+
+    # ---------------- 会话 ----------------
 
     async def list_sessions(self, session: aiohttp.ClientSession) -> list[dict[str, Any]]:
-        value = await self.rpc(session, "session.list", {})
+        value = await self.rpc(session, "session/list", {"_request": {}})
         return value.get("items", []) if isinstance(value, dict) else []
 
     async def search_sessions(self, session: aiohttp.ClientSession, query: str) -> dict[str, Any]:
-        return await self.rpc(session, "session.search", {"query": query})
+        value = await self.rpc(session, "session/search", {"request": {"query": query}})
+        return value if isinstance(value, dict) else {}
 
     async def create_session(
         self,
@@ -154,26 +332,27 @@ class DshHttpClient:
         agent_preset: str = "",
         workspace_id: str = "",
     ) -> str:
-        payload: dict[str, Any] = {}
+        request: dict[str, Any] = {}
         if workspace_id:
-            payload["workspaceId"] = workspace_id
+            request["workspaceId"] = workspace_id
         elif cwd:
-            payload["cwd"] = cwd
+            request["cwd"] = cwd
         if agent_preset:
-            payload["agentPreset"] = agent_preset
-        value = await self.rpc(session, "session.create", payload)
+            request["agentPreset"] = agent_preset
+        value = await self.rpc(session, "session/create", {"request": request})
         return str((value or {}).get("sessionId") or "")
 
     async def rename_session(self, session: aiohttp.ClientSession, session_id: str, title: str) -> dict[str, Any]:
-        return await self.rpc(session, "session.rename", {"sessionId": session_id, "title": title})
+        value = await self.rpc(session, "session/rename", {"request": {"sessionId": session_id, "title": title}})
+        return value if isinstance(value, dict) else {}
 
     async def fork_session(
         self, session: aiohttp.ClientSession, session_id: str, at_seq: int | None = None
     ) -> str:
-        payload: dict[str, Any] = {"sessionId": session_id}
+        request: dict[str, Any] = {"sessionId": session_id}
         if at_seq is not None:
-            payload["atSeq"] = at_seq
-        value = await self.rpc(session, "session.fork", payload)
+            request["atSeq"] = at_seq
+        value = await self.rpc(session, "session/fork", {"request": request})
         return str((value or {}).get("sessionId") or "")
 
     async def prompt(
@@ -184,24 +363,53 @@ class DshHttpClient:
         mode: str = "queue",
         client_time_zone: str = "",
     ) -> dict[str, Any]:
-        return await self.rpc(
-            session,
-            "session.prompt",
-            {
-                "sessionId": session_id,
-                "mode": mode,
-                "content": [{"type": "text", "text": text}],
-                "clientTimeZone": normalize_client_time_zone(client_time_zone),
-            },
-        )
+        request = {
+            "requestId": str(uuid.uuid4()),
+            "sessionId": session_id,
+            "mode": mode,
+            "content": [{"type": "text", "text": text}],
+            "clientTimeZone": normalize_client_time_zone(client_time_zone),
+        }
+        return await self.rpc(session, "session/prompt", {"request": request})
 
     async def cancel(self, session: aiohttp.ClientSession, session_id: str) -> bool:
-        value = await self.rpc(session, "session.cancel", {"sessionId": session_id})
+        value = await self.rpc(session, "session/cancel", {"request": {"sessionId": session_id}})
         return bool((value or {}).get("accepted"))
 
     async def archive_session(self, session: aiohttp.ClientSession, session_id: str) -> dict[str, Any]:
         """Remove a session from DSH's visible workspace list durably."""
-        value = await self.rpc(session, "workspace.archiveSession", {"sessionId": session_id})
+        value = await self.rpc(session, "workspace/archiveSession", {"request": {"sessionId": session_id}})
+        return value if isinstance(value, dict) else {}
+
+    async def projections(self, session: aiohttp.ClientSession, session_id: str) -> dict[str, Any]:
+        value = await self.rpc(session, "session/projections", {"request": {"sessionId": session_id}})
+        return value if isinstance(value, dict) else {}
+
+    async def cursor(self, session: aiohttp.ClientSession, session_id: str) -> int:
+        """Return the Session's current log cursor (the ``throughSeq`` ceiling)."""
+        value = await self.projections(session, session_id)
+        try:
+            return int(value.get("asOfSeq") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def page(
+        self,
+        session: aiohttp.ClientSession,
+        session_id: str,
+        through_seq: int,
+        max_messages: int = 100,
+        before_seq: int | None = None,
+    ) -> dict[str, Any]:
+        """Read one message-aligned backwards page ending at ``through_seq``."""
+        request: dict[str, Any] = {
+            "address": {"kind": "session", "sessionId": session_id},
+            "throughSeq": int(through_seq),
+            "maxMessages": int(max_messages),
+        }
+        if before_seq is not None:
+            request["beforeSeq"] = int(before_seq)
+        value = await self.rpc(session, "session/page", {"request": request})
         return value if isinstance(value, dict) else {}
 
     async def history_value(
@@ -211,18 +419,36 @@ class DshHttpClient:
         max_messages: int = 100,
         before_seq: int | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"sessionId": session_id, "maxMessages": max_messages}
-        if before_seq is not None:
-            payload["beforeSeq"] = before_seq
-        value = await self.rpc(session, "session.history", payload)
-        return value if isinstance(value, dict) else {}
+        projections = await self.projections(session, session_id)
+        try:
+            through_seq = int(projections.get("asOfSeq") or 0)
+        except (TypeError, ValueError):
+            through_seq = 0
+        value = await self.page(session, session_id, through_seq, max_messages, before_seq)
+        return {
+            "events": value.get("records") or [],
+            "hasMore": bool(value.get("hasMore")),
+            "projections": projections,
+            "cursor": through_seq,
+        }
 
     async def history(self, session: aiohttp.ClientSession, session_id: str, max_messages: int = 100) -> list:
         return (await self.history_value(session, session_id, max_messages)).get("events", [])
 
     async def models(self, session: aiohttp.ClientSession, session_id: str) -> dict[str, Any]:
-        value = await self.rpc(session, "session.models", {"sessionId": session_id})
-        return value if isinstance(value, dict) else {}
+        """Return the model catalog plus the Session's current selection."""
+        catalog = await self.rpc(session, "session/modelCatalog", {})
+        catalog = catalog if isinstance(catalog, dict) else {}
+        selection: dict[str, Any] = {}
+        try:
+            projections = await self.projections(session, session_id)
+            selection = ((projections.get("values") or {}).get("modelSelection") or {})
+        except DshError:
+            selection = {}
+        current = selection.get("next") or selection.get("lastUsed") or catalog.get("default") or {}
+        value = dict(catalog)
+        value["current"] = current
+        return value
 
     async def select_model(
         self,
@@ -232,10 +458,10 @@ class DshHttpClient:
         model: str,
         reasoning_effort: str = "",
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"sessionId": session_id, "provider": provider, "model": model}
+        request: dict[str, Any] = {"sessionId": session_id, "provider": provider, "model": model}
         if reasoning_effort:
-            payload["reasoningEffort"] = reasoning_effort
-        value = await self.rpc(session, "session.selectModel", payload)
+            request["reasoningEffort"] = reasoning_effort
+        value = await self.rpc(session, "session/selectModel", {"request": request})
         return value if isinstance(value, dict) else {}
 
     async def update_queue(
@@ -249,19 +475,20 @@ class DshHttpClient:
         action_value: dict[str, Any] = {"kind": action}
         if action == "edit":
             action_value["content"] = [{"type": "text", "text": text}]
-        return await self.rpc(
+        value = await self.rpc(
             session,
-            "session.updateQueue",
-            {"sessionId": session_id, "itemId": item_id, "action": action_value},
+            "session/updateQueue",
+            {"request": {"sessionId": session_id, "itemId": item_id, "action": action_value}},
         )
+        return value if isinstance(value, dict) else {}
 
     async def attachment(
         self, session: aiohttp.ClientSession, session_id: str, attachment_id: str
     ) -> dict[str, Any]:
         value = await self.rpc(
             session,
-            "session.attachment",
-            {"sessionId": session_id, "attachmentId": attachment_id},
+            "session/attachment",
+            {"request": {"sessionId": session_id, "attachmentId": attachment_id}},
         )
         return value if isinstance(value, dict) else {}
 
@@ -288,12 +515,25 @@ class DshHttpClient:
                     resolved.append(data_url)
         return DshReply(text=reply.text, image_sources=resolved)
 
+    # ---------------- Settings ----------------
+
     async def settings(self, session: aiohttp.ClientSession) -> dict[str, Any]:
-        value = await self.rpc(session, "settings.describe", {})
+        value = await self.rpc(session, "settings/describe", {})
         return value if isinstance(value, dict) else {}
 
     async def permission_presets(self, session: aiohttp.ClientSession) -> list[str]:
-        """Read the permission preset enum published by the DSH host."""
+        """Read the permission preset catalog published by the DSH host."""
+        try:
+            catalog = await self.rpc(session, "permissionPresets/catalog", {})
+        except DshError:
+            catalog = {}
+        values = [
+            str(entry.get("value"))
+            for entry in (catalog.get("options") if isinstance(catalog, dict) else []) or []
+            if isinstance(entry, dict) and entry.get("value")
+        ]
+        if values:
+            return values
         description = await self.settings(session)
         namespace = next(
             (row for row in description.get("namespaces") or []
@@ -307,12 +547,12 @@ class DshHttpClient:
         root = refs.get(str(schema.get("uid"))) or {}
         default_ref = (root.get("dict") or {}).get("defaultPreset")
         union = refs.get(str(default_ref)) or {}
-        values: list[str] = []
+        fallback: list[str] = []
         for ref_id in union.get("list") or []:
             value = (refs.get(str(ref_id)) or {}).get("value")
             if isinstance(value, str) and value:
-                values.append(value)
-        return values
+                fallback.append(value)
+        return fallback
 
     async def mutate_settings(
         self,
@@ -321,61 +561,102 @@ class DshHttpClient:
         operations: list[dict[str, Any]],
         expected_revision: int | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"ns": namespace, "ops": operations}
+        args: dict[str, Any] = {"ns": namespace, "ops": operations}
         if expected_revision is not None:
-            payload["expectedRevision"] = expected_revision
-        return await self.rpc(session, "settings.mutate", payload)
+            args["expectedRevision"] = expected_revision
+        value = await self.rpc(session, "settings/mutate", args)
+        return value if isinstance(value, dict) else {}
+
+    # ---------------- LLM / Preset / Skill / Subagent ----------------
 
     async def providers(self, session: aiohttp.ClientSession) -> dict[str, Any]:
-        return await self.rpc(session, "llm.providers", {})
+        value = await self.rpc(session, "llm/listConfigurableProviders", {})
+        return {"providers": value if isinstance(value, list) else []}
 
     async def global_models(self, session: aiohttp.ClientSession) -> dict[str, Any]:
-        return await self.rpc(session, "llm.models", {})
+        value = await self.rpc(session, "session/modelCatalog", {})
+        return value if isinstance(value, dict) else {}
 
     async def presets(self, session: aiohttp.ClientSession) -> dict[str, Any]:
-        return await self.rpc(session, "agentPreset.list", {})
+        value = await self.rpc(session, "agentPresets/list", {})
+        return value if isinstance(value, dict) else {}
 
     async def select_preset(
         self, session: aiohttp.ClientSession, session_id: str, agent_preset: str
     ) -> dict[str, Any]:
-        return await self.rpc(
+        value = await self.rpc(
             session,
-            "agentPreset.select",
-            {"sessionId": session_id, "agentPreset": agent_preset},
+            "agentPresets/select",
+            {"agentId": session_id, "agentPreset": agent_preset},
         )
+        return value if isinstance(value, dict) else {}
 
     async def read_preset(self, session: aiohttp.ClientSession, agent_preset: str) -> dict[str, Any]:
-        return await self.rpc(session, "agentPreset.read", {"agentPreset": agent_preset})
+        value = await self.rpc(session, "agentPresets/read", {"agentPreset": agent_preset})
+        return value if isinstance(value, dict) else {}
 
     async def skills(self, session: aiohttp.ClientSession, session_id: str) -> dict[str, Any]:
-        return await self.rpc(session, "skill.list", {"sessionId": session_id})
+        value = await self.rpc(session, "skills/list", {"request": {"sessionId": session_id}})
+        return value if isinstance(value, dict) else {}
 
     async def subagents(self, session: aiohttp.ClientSession, session_id: str) -> dict[str, Any]:
-        return await self.rpc(session, "subagent.list", {"parentSessionId": session_id})
+        """List child Sessions of one parent Session.
+
+        DSH 0.2 removed ``subagent.list``; child Sessions are ordinary Session
+        rows carrying ``parentSessionId``, so the visible ones are derived from
+        ``session/list`` instead of a dedicated catalog.
+        """
+        entries: list[dict[str, Any]] = []
+        for row in await self.list_sessions(session):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("parentSessionId") or "") != session_id:
+                continue
+            values = (row.get("projections") or {}).get("values") or {}
+            entries.append({
+                "id": row.get("sessionId"),
+                "kind": "subagent",
+                "mode": "",
+                "activity": "running" if row.get("running") else "idle",
+                "label": str(values.get("title") or ""),
+            })
+        return {"entries": entries}
 
     async def interrupt_subagent(
         self, session: aiohttp.ClientSession, parent_session_id: str, child_session_id: str
     ) -> dict[str, Any]:
-        return await self.rpc(
+        value = await self.rpc(
             session,
-            "subagent.interrupt",
-            {"parentSessionId": parent_session_id, "childSessionId": child_session_id, "mode": "continuable"},
+            "subagents/interruptByParent",
+            {
+                "parentSessionId": parent_session_id,
+                "childSessionId": child_session_id,
+                "mode": "continuable",
+            },
         )
+        return value if isinstance(value, dict) else {}
 
-    async def workspaces(self, session: aiohttp.ClientSession) -> dict[str, Any]:
-        return await self.rpc(session, "workspace.list", {})
+    # ---------------- Workspace ----------------
 
     async def create_workspace(self, session: aiohttp.ClientSession, path: str) -> dict[str, Any]:
-        return await self.rpc(session, "workspace.create", {"path": path})
+        value = await self.rpc(session, "workspace/create", {"request": {"path": path}})
+        return value if isinstance(value, dict) else {}
 
     async def rename_workspace(
         self, session: aiohttp.ClientSession, workspace_id: str, title: str
     ) -> dict[str, Any]:
-        return await self.rpc(
+        value = await self.rpc(
             session,
-            "workspace.rename",
-            {"workspaceId": workspace_id, "title": title},
+            "workspace/rename",
+            {"request": {"workspaceId": workspace_id, "title": title}},
         )
+        return value if isinstance(value, dict) else {}
+
+    # ---------------- Goal ----------------
+
+    async def goal(self, session: aiohttp.ClientSession, session_id: str) -> dict[str, Any] | None:
+        value = await self.rpc(session, "goals/get", {"agentId": session_id})
+        return value if isinstance(value, dict) else None
 
     async def goal_action(
         self,
@@ -386,21 +667,26 @@ class DshHttpClient:
         objective: str = "",
         max_rounds: int | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"sessionId": session_id}
+        request: dict[str, Any] = {}
         if action == "create":
-            payload["objective"] = objective
+            request["objective"] = objective
             if max_rounds is not None:
-                payload["maxGoalRounds"] = max_rounds
+                request["maxGoalRounds"] = max_rounds
+            args: dict[str, Any] = {"agentId": session_id, "request": request}
         else:
             if not goal:
                 raise DshError("当前会话没有可操作的 goal。")
-            payload["ref"] = {"id": goal.get("id"), "revision": goal.get("revision")}
+            args = {"agentId": session_id, "ref": {"id": goal.get("id"), "revision": goal.get("revision")}}
             if action == "edit":
                 if objective:
-                    payload["objective"] = objective
+                    request["objective"] = objective
                 if max_rounds is not None:
-                    payload["maxGoalRounds"] = max_rounds
-        return await self.rpc(session, f"goal.{action}", payload)
+                    request["maxGoalRounds"] = max_rounds
+                args["request"] = request
+        value = await self.rpc(session, f"goals/{action}", args)
+        return value if isinstance(value, dict) else {}
+
+    # ---------------- 任务执行 ----------------
 
     async def run_prompt(
         self,
@@ -412,7 +698,7 @@ class DshHttpClient:
     ) -> DshReply:
         if mode == "queue":
             await self._wait_idle(session, session_id)
-        baseline = await self._last_seq(session, session_id)
+        baseline = await self.cursor(session, session_id)
         await self.prompt(
             session,
             session_id,
@@ -421,10 +707,6 @@ class DshHttpClient:
             client_time_zone=client_time_zone,
         )
         return await self._await_reply(session, session_id, baseline)
-
-    async def _last_seq(self, session: aiohttp.ClientSession, session_id: str) -> int:
-        events = await self.history(session, session_id, max_messages=5)
-        return max((event_seq(entry.get("event") if isinstance(entry, dict) else entry) for entry in events), default=0)
 
     async def _wait_idle(self, session: aiohttp.ClientSession, session_id: str) -> None:
         deadline = time.monotonic() + self.timeout
@@ -445,28 +727,30 @@ class DshHttpClient:
         deadline = time.monotonic() + self.timeout
         last_reply = DshReply()
         while time.monotonic() < deadline:
-            events = await self.history(session, session_id, max_messages=100)
-            reason = None
-            for entry in events:
-                event = entry.get("event") if isinstance(entry, dict) else None
-                if not event or event_seq(event) <= baseline:
-                    continue
-                event_type = event.get("type")
-                if event_type == "assistant/message":
-                    # DSH emits one finalized assistant message per provider/tool
-                    # step. The last finalized message is the turn result; earlier
-                    # messages are intermediate step output and must not be folded
-                    # into the final card.
-                    last_reply = assistant_reply(event)
-                elif event_type == "turn/end":
-                    reason = (event.get("data") or {}).get("reason") or {}
-            if reason is not None:
-                if reason.get("kind") == "error":
-                    error = reason.get("error") or {}
-                    raise DshError(
-                        f"DeepSeek Harness 任务失败：{error.get('code', 'error')} {error.get('message', '')}".strip()
-                    )
-                return await self.resolve_reply_attachments(session, session_id, last_reply)
+            cursor = await self.cursor(session, session_id)
+            if cursor > baseline:
+                page = await self.page(session, session_id, cursor, max_messages=100)
+                reason = None
+                for entry in page.get("records") or []:
+                    event = entry.get("event") if isinstance(entry, dict) else None
+                    if not isinstance(event, dict) or event_seq(event) <= baseline:
+                        continue
+                    event_type = event.get("type")
+                    if event_type == "assistant/message":
+                        # DSH emits one finalized assistant message per provider/tool
+                        # step. The last finalized message is the turn result; earlier
+                        # messages are intermediate step output and must not be folded
+                        # into the final card.
+                        last_reply = assistant_reply(event)
+                    elif event_type == "turn/end":
+                        reason = (event.get("data") or {}).get("reason") or {}
+                if reason is not None:
+                    if reason.get("kind") == "error":
+                        error = reason.get("error") or {}
+                        raise DshError(
+                            f"DeepSeek Harness 任务失败：{error.get('code', 'error')} {error.get('message', '')}".strip()
+                        )
+                    return await self.resolve_reply_attachments(session, session_id, last_reply)
             await asyncio.sleep(self.poll_interval)
         if last_reply.text or last_reply.image_sources:
             timed_out = DshReply(

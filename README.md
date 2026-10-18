@@ -1,6 +1,6 @@
 # AstrBot DSH Connector
 
-面向 DeepSeek Harness Web Host 的 AstrBot 连接器。每个 AstrBot 聊天窗口拥有独立的 DSH 会话绑定和创建选项，任务结果以文本、图片及 DSH 原生 attachment 形式回传。
+面向 DeepSeek Harness（DSH 0.2+）Web Host 的 AstrBot 连接器。每个 AstrBot 聊天窗口拥有独立的 DSH 会话绑定和创建选项，任务结果以文本、图片及 DSH 原生 attachment 形式回传。
 
 仓库地址：<https://github.com/konodiodaaaaa1/astrbot_plugin_dsh_connector>
 
@@ -12,7 +12,15 @@
 dsh web --port 3080
 ```
 
-插件默认连接 `http://127.0.0.1:3080`。AstrBot 插件配置页负责连接地址、超时、图片限额和 LLM 工具开关。
+插件默认连接 `http://127.0.0.1:3080`。AstrBot 插件配置页负责连接地址、DSH 主目录、默认工作目录、超时、图片限额和 LLM 工具开关。
+
+## 兼容性与认证
+
+插件调用 DSH 0.2 起的 Typert RPC：端点为 `/api/<namespace>/<method>`，请求体是 `{"args": {...}}`。DSH 0.2 同时给 `/api` 加了浏览器会话认证——只有 `dsh web` 启动时打印的 `?token=` URL 能换取 `dsh-auth-*` 签名 cookie，且不接受 `Authorization` 头。插件不要求复制那个一次性 token，而是读取 DSH 持久化的签名密钥（`$DSH_HOME/.credentials.yaml` 里的 `client-connection/browser-session` 记录）在本地现签 cookie，所以 DSH 重启后无需重新配置。
+
+`dsh_home` 留空时按环境变量 `DSH_HOME`、再退回 `~/.dsh` 定位；DSH 装在别处时把它指过去即可。工作区列表也从同一目录的 `storages/workspace.json` 读取，因为 DSH 0.2 不再提供 `workspace.list`。`http` 模式要求 `http_base_url` 是回环地址（`127.0.0.1` 或 `localhost`），DSH 的 Host 校验会拒绝其它 authority；新建会话未指定目录时，依次使用配置 `default_cwd`、DSH 已登记的第一个工作区路径、用户主目录。
+
+`headless` 模式仍可单独使用（`dsh --profile headless "<指令>"`），但它每条消息都会起一个新进程，也无法复用 HTTP 模式按聊天绑定的会话，仅建议作为应急回退。
 
 ## 聊天窗口配置
 
@@ -88,9 +96,11 @@ dsh web --port 3080
 连接器直接调用 DSH RPC，可查询和控制以下域：
 
 - Settings namespace、JSON Schema、路径级 `set`/`unset`
-- LLM providers 与模型目录
+- LLM providers 与模型目录（`session/modelCatalog`、`llm/listConfigurableProviders`）
 - Agent Presets、Skills、Subagents、Goals、Workspaces
 - Session search、fork、queue、cancel 和 attachment
+
+会话历史与回复轮询走 `session/projections`（取当前 `asOfSeq` 游标）加 `session/page`（按游标翻页），不再依赖 DSH 0.2 已删除的 `session.history`。
 
 示例：
 

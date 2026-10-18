@@ -119,7 +119,13 @@ class Main(Star):
         base_url = str(self._cfg("http_base_url", "http://127.0.0.1:3080"))
         timeout = float(self._cfg("command_timeout", 600))
         poll_interval = float(self._cfg("poll_interval", 1.0))
-        return DshHttpClient(base_url, timeout, poll_interval)
+        return DshHttpClient(
+            base_url,
+            timeout,
+            poll_interval,
+            dsh_home=str(self._cfg("dsh_home", "") or ""),
+            default_cwd=str(self._cfg("default_cwd", "") or ""),
+        )
 
     # ---------------- 会话映射（尽力持久化） ----------------
 
@@ -561,7 +567,10 @@ class Main(Star):
             values = projection_values(row)
             goal = values.get("goal") or {}
             goal_phase = ((goal.get("goal") or {}).get("phase")) if isinstance(goal, dict) else None
-            lines.append(f"{index}. {session_label(row)}\n   cwd={row.get('cwd', '?')} preset={row.get('agentPreset', '?')} goal={goal_phase or '-'}")
+            lines.append(
+                f"{index}. {session_label(row)}\n"
+                f"   cwd={row.get('cwd', '?')} preset={values.get('agentPreset', '?')} goal={goal_phase or '-'}"
+            )
         return "\n".join(lines)
 
     async def _history_text(self, event: AstrMessageEvent, command: str) -> str:
@@ -687,7 +696,7 @@ class Main(Star):
                 async with aiohttp.ClientSession() as http_session:
                     value = await client.presets(http_session)
                 return "\n".join(["【DSH Agent Presets]"] + [
-                    f"- {row.get('id')} trust={row.get('trust')} default={row.get('isDefault')} {row.get('name', '')} {row.get('description', '')}"
+                    f"- {row.get('id')} default={row.get('isDefault')} order={row.get('order')}"
                     for row in value.get("presets") or []
                 ])
             if action == "read":
@@ -1035,7 +1044,9 @@ class Main(Star):
             providers = value.get("providers") or []
             lines = ["【DSH LLM 服务商】"]
             lines.extend(
-                f"- {row.get('provider')} ({row.get('displayName')}) active={row.get('active')} setting={row.get('settingsNs')}.{'.'.join(row.get('settingsPath') or [])}"
+                f"- {row.get('provider')} ({row.get('displayName')}) "
+                f"declared={row.get('declared', True)} "
+                f"setting={row.get('settingsNs')}.{'.'.join(row.get('settingsPath') or [])}"
                 for row in providers
             )
             return "\n".join(lines)
