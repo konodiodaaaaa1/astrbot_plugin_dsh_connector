@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.1.1 - 2026-10-18
+
+- 新增 DSH 授权请求桥：通过 `/api/remote.mux` 的 `$events` 流接收 `approval/request`，在绑定的聊天里提示，并用 `/dsh approve`、`/dsh deny` 经 `$events/result` 回送结论。
+- 新增会话到聊天的反向索引（AstrBot KV），授权请求能路由回原聊天；DSH 界面取消的请求会同步提示。
+- 修复长任务完成不唤醒的问题：`command_timeout` 到期后不再放弃，后台继续监视 turn，完成时主动把结果发到聊天；`completion_watch_timeout` 控制监视上限。
+- 新增 `/dsh approvals` 与状态里的「事件桥 / 待授权」信息。
+- 事件桥断线自动重连；插件重载后 DSH 会重新投递未回答的授权请求。
+
 ## 2.1.0 - 2026-10-18
 
 - 适配 DSH 0.2.0-rc.2：RPC 端点从点号方法切换到 Typert 的 `<namespace>/<method>`，payload 统一为 `{"args": {...}}`。

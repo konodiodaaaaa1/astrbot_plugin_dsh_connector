@@ -13,6 +13,7 @@ class SessionState:
     def __init__(self) -> None:
         self.session_cache: dict[str, str] = {}
         self.options_cache: dict[str, dict[str, str]] = {}
+        self.owners_cache: dict[str, str] | None = None
 
     async def load_session(self, plugin: Any, chat_key: str) -> str | None:
         if chat_key in self.session_cache:
@@ -35,9 +36,55 @@ class SessionState:
             await plugin.put_kv_data(f"dsh_session:{chat_key}", session_id)
 
     async def clear_session(self, plugin: Any, chat_key: str) -> None:
+        session_id = self.session_cache.get(chat_key)
+        if session_id is None and hasattr(plugin, "get_kv_data"):
+            try:
+                session_id = str(await plugin.get_kv_data(f"dsh_session:{chat_key}", "") or "") or None
+            except Exception:
+                session_id = None
         self.session_cache.pop(chat_key, None)
+        if session_id:
+            await self.forget_owner(plugin, session_id)
         if hasattr(plugin, "delete_kv_data"):
             await plugin.delete_kv_data(f"dsh_session:{chat_key}")
+
+    async def load_owners(self, plugin: Any) -> dict[str, str]:
+        """Return the DSH session id to chat-key index used for event routing."""
+        if self.owners_cache is not None:
+            return dict(self.owners_cache)
+        raw = None
+        if hasattr(plugin, "get_kv_data"):
+            try:
+                raw = await plugin.get_kv_data("dsh_session_owners", None)
+            except Exception:
+                raw = None
+        owners: dict[str, str] = {}
+        if isinstance(raw, dict):
+            owners = {str(key): str(value) for key, value in raw.items() if key and value}
+        self.owners_cache = owners
+        return dict(owners)
+
+    async def remember_owner(self, plugin: Any, session_id: str, chat_key: str) -> None:
+        owners = await self.load_owners(plugin)
+        if owners.get(session_id) == chat_key:
+            return
+        owners[session_id] = chat_key
+        self.owners_cache = owners
+        if hasattr(plugin, "put_kv_data"):
+            await plugin.put_kv_data("dsh_session_owners", owners)
+
+    async def forget_owner(self, plugin: Any, session_id: str) -> None:
+        owners = await self.load_owners(plugin)
+        if session_id not in owners:
+            return
+        owners.pop(session_id, None)
+        self.owners_cache = owners
+        if hasattr(plugin, "put_kv_data"):
+            await plugin.put_kv_data("dsh_session_owners", owners)
+
+    async def owner_of(self, plugin: Any, session_id: str) -> str | None:
+        owners = await self.load_owners(plugin)
+        return owners.get(session_id)
 
     async def load_option(self, plugin: Any, chat_key: str, key: str, default: str = "") -> str:
         if not hasattr(plugin, "get_kv_data"):

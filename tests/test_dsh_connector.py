@@ -1,7 +1,9 @@
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
+import logging
 import sys
 import tempfile
 import unittest
@@ -9,10 +11,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core.approval_bridge import DshEventBridge
 from core.config_service import dotted_path, namespace_map, parse_json_value, read_path
 from core.dsh_client import (
     DshError,
     DshHttpClient,
+    DshTimeout,
     build_auth_cookie,
     extract_browser_session_secret,
     normalize_client_time_zone,
@@ -39,6 +43,8 @@ class DshConnectorHelperTests(unittest.TestCase):
 
         self.assertIn("/dsh help", HELP_TEXT)
         self.assertIn("/dsh session delete [id]", HELP_TEXT)
+        self.assertIn("/dsh approve", HELP_TEXT)
+        self.assertIn("/dsh deny", HELP_TEXT)
 
     def test_assistant_reply_keeps_text_and_distinct_images(self):
         reply = assistant_reply({
@@ -485,6 +491,226 @@ class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls, [("permissionPresets/catalog", {})])
 
 
+class DshApprovalBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bridge_dispatches_approval_and_answers_via_event_result(self):
+        seen = []
+        answers = []
+
+        class Client:
+            def auth_cookie(self):
+                return "dsh-auth-test=value"
+
+            def websocket_url(self, path):
+                return "ws://example.test" + path
+
+            async def rpc(self, _session, method, args=None):
+                answers.append((method, args))
+                return None
+
+        async def on_frame(frame):
+            seen.append(frame)
+
+        bridge = DshEventBridge(Client(), object(), on_frame, logging.getLogger("dsh-connector-test"))
+        bridge._receive(json.dumps({"type": "item", "value": {"type": "ready", "clientId": "client-a"}}))
+        bridge._receive(json.dumps({"type": "item", "value": {
+            "type": "waterfall",
+            "event": "approval/request",
+            "eventId": "event-a",
+            "agentId": "session-a",
+            "request": {"toolName": "pwsh"},
+        }}))
+        await asyncio.sleep(0)
+
+        self.assertEqual(bridge.client_id, "client-a")
+        self.assertTrue(bridge.connected)
+        self.assertEqual(seen[0]["eventId"], "event-a")
+
+        await bridge.answer("event-a", "allowed-once")
+        self.assertEqual(answers, [("$events/result", {
+            "clientId": "client-a",
+            "eventId": "event-a",
+            "outcome": {"kind": "result", "value": "allowed-once"},
+        })])
+
+    async def test_bridge_refuses_to_answer_before_its_ready_frame(self):
+        class Client:
+            def auth_cookie(self):
+                return ""
+
+            def websocket_url(self, path):
+                return "ws://example.test" + path
+
+            async def rpc(self, *_args, **_kwargs):
+                raise AssertionError("must not post before ready")
+
+        bridge = DshEventBridge(Client(), object(), lambda _frame: None, logging.getLogger("test"))
+        with self.assertRaises(DshError):
+            await bridge.answer("event-a", "rejected")
+
+
+class DshApprovalRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_approval_is_forwarded_to_the_bound_chat_and_answered(self):
+        from main import Main
+        from core.session_state import SessionState
+
+        plugin = object.__new__(Main)
+        plugin.config = {"route_approvals": True}
+        plugin._state = SessionState()
+        plugin._state.owners_cache = {"session-a": "chat-a"}
+        plugin._pending_approvals = {}
+        plugin._approval_tasks = set()
+        sent = []
+        answered = []
+
+        async def send_text(chat_key, text):
+            sent.append((chat_key, text))
+
+        plugin._send_text = send_text
+
+        class Bridge:
+            async def answer(self, event_id, outcome):
+                answered.append((event_id, outcome))
+
+        plugin._bridge = Bridge()
+        frame = {
+            "type": "waterfall",
+            "event": "approval/request",
+            "eventId": "event-a",
+            "agentId": "session-a",
+            "request": {"toolName": "pwsh", "reason": "需要写入工作区外文件"},
+        }
+        task = asyncio.create_task(plugin._handle_approval(frame))
+        await asyncio.sleep(0)
+
+        self.assertEqual(sent[0][0], "chat-a")
+        self.assertIn("DSH 请求授权", sent[0][1])
+        self.assertIn("pwsh", sent[0][1])
+        self.assertEqual(
+            await plugin._resolve_approval("chat-a", "allowed-once"),
+            "已允许本次工具调用。",
+        )
+        await task
+        self.assertEqual(answered, [("event-a", "allowed-once")])
+
+    async def test_approval_without_a_bound_chat_is_left_to_the_dsh_gui(self):
+        from main import Main
+        from core.session_state import SessionState
+
+        plugin = object.__new__(Main)
+        plugin.config = {"route_approvals": True}
+        plugin._state = SessionState()
+        plugin._state.owners_cache = {}
+        plugin._pending_approvals = {}
+        sent = []
+
+        async def send_text(chat_key, text):
+            sent.append((chat_key, text))
+
+        plugin._send_text = send_text
+        frame = {
+            "type": "waterfall",
+            "event": "approval/request",
+            "eventId": "event-b",
+            "agentId": "session-gui",
+            "request": {"toolName": "pwsh"},
+        }
+        await plugin._handle_approval(frame)
+        self.assertEqual(sent, [])
+        self.assertEqual(plugin._pending_approvals, {})
+
+
+class DshCompletionWatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_watcher_pushes_a_finished_turn_to_the_chat(self):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = {
+            "completion_watch_timeout": 60,
+            "reply_render_mode": "text",
+            "max_reply_chars": 0,
+            "max_images_per_reply": 0,
+        }
+        sent = []
+
+        async def send_message(chat_key, chain):
+            sent.append((chat_key, [part.text for part in chain]))
+
+        plugin._send_message = send_message
+
+        class Client:
+            async def await_turn(self, _session, session_id, baseline, timeout=None):
+                return DshReply(text="后台完成")
+
+        plugin._make_http_client = lambda: Client()
+        await plugin._watch_completion("chat-a", "session-a", 0)
+        self.assertEqual(sent, [("chat-a", ["后台完成"])])
+
+    async def test_timed_out_turn_starts_a_background_watcher(self):
+        from main import Main
+        from core.session_options import normalize_session_options
+
+        plugin = object.__new__(Main)
+        plugin.config = {
+            "command_timeout": 1,
+            "poll_interval": 0.05,
+            "reply_render_mode": "text",
+            "max_reply_chars": 0,
+            "max_images_per_reply": 0,
+            "completion_watch_timeout": 60,
+        }
+        plugin._state = SessionState()
+        plugin._state.session_cache["chat-a"] = "session-a"
+        plugin._state.options_cache["chat-a"] = normalize_session_options({})
+        plugin._completion_tasks = set()
+        clients = []
+        sent = []
+
+        class Client:
+            def __init__(self, fail):
+                self.fail = fail
+
+            async def wait_idle(self, *_args):
+                return None
+
+            async def cursor(self, *_args):
+                return 5
+
+            async def prompt(self, *_args, **_kwargs):
+                return {"accepted": True}
+
+            async def await_turn(self, _session, session_id, baseline, timeout=None):
+                if self.fail:
+                    raise DshTimeout("等待超时")
+                return DshReply(text="后台结果")
+
+        def make_client():
+            client = Client(fail=not clients)
+            clients.append(client)
+            return client
+
+        async def send_message(chat_key, chain):
+            sent.append((chat_key, [part.text for part in chain]))
+
+        plugin._make_http_client = make_client
+        plugin._send_message = send_message
+
+        class Event:
+            unified_msg_origin = "chat-a"
+
+            def get_sender_id(self):
+                return "1"
+
+        with self.assertRaises(DshTimeout) as caught:
+            await plugin._run_http(Event(), "long task")
+        self.assertIn("后台", str(caught.exception))
+
+        for _ in range(100):
+            if sent:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(sent, [("chat-a", ["后台结果"])])
+
+
 class DshSessionStateTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_state_persists_and_reuses_chat_binding(self):
         class Plugin:
@@ -524,6 +750,29 @@ class DshSessionStateTests(unittest.IsolatedAsyncioTestCase):
         await state.update_options(plugin, "chat-b", {"working_directory": "D:/B"})
         self.assertEqual((await state.load_options(plugin, "chat-a"))["working_directory"], "D:/A")
         self.assertEqual((await state.load_options(plugin, "chat-b"))["working_directory"], "D:/B")
+
+    async def test_session_owner_index_routes_events_back_to_the_chat(self):
+        class Plugin:
+            def __init__(self):
+                self.store = {}
+
+            async def get_kv_data(self, key, default):
+                return self.store.get(key, default)
+
+            async def put_kv_data(self, key, value):
+                self.store[key] = value
+
+            async def delete_kv_data(self, key):
+                self.store.pop(key, None)
+
+        plugin = Plugin()
+        state = SessionState()
+        await state.remember_owner(plugin, "session-a", "chat-a")
+        self.assertEqual(await state.owner_of(plugin, "session-a"), "chat-a")
+        self.assertEqual(await SessionState().owner_of(plugin, "session-a"), "chat-a")
+
+        await state.forget_owner(plugin, "session-a")
+        self.assertIsNone(await SessionState().owner_of(plugin, "session-a"))
 
 
 class DshConnectorImageTests(unittest.IsolatedAsyncioTestCase):

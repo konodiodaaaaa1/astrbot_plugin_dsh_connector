@@ -6,7 +6,7 @@ desc: >-
   兼容 DSH 0.2 起的 Typert RPC 与浏览器会话认证。
   每个聊天窗口独立保存工作空间或目录、Agent Preset、模型、推理强度、权限和 IANA 时区，
   并支持 DSH 原生 attachment 图片、Settings、Skills、Subagents、Goals 与 Workspaces。
-version: 2.1.0
+version: 2.1.1
 author: konodiodaaaaa1
 repo: https://github.com/konodiodaaaaa1/astrbot_plugin_dsh_connector
 astrbot_version: ">=4.0.0"

@@ -191,6 +191,19 @@ class DshHttpClient:
                 raise
         return build_auth_cookie(self._secret, self.authority)
 
+    def auth_cookie(self) -> str:
+        """Return the signed browser-session cookie for custom carriers."""
+        return self._auth_cookie()
+
+    def websocket_url(self, path: str) -> str:
+        """Map one HTTP carrier path onto the matching WebSocket URL."""
+        base = self.base_url
+        if base.startswith("https://"):
+            base = "wss://" + base[len("https://"):]
+        elif base.startswith("http://"):
+            base = "ws://" + base[len("http://"):]
+        return base + path
+
     @staticmethod
     def _http_error(method: str, status: int, body: str) -> DshError:
         if status == 401:
@@ -708,6 +721,20 @@ class DshHttpClient:
         )
         return await self._await_reply(session, session_id, baseline)
 
+    async def wait_idle(self, session: aiohttp.ClientSession, session_id: str) -> None:
+        """Wait until the Session has no running turn."""
+        await self._wait_idle(session, session_id)
+
+    async def await_turn(
+        self,
+        session: aiohttp.ClientSession,
+        session_id: str,
+        baseline: int,
+        timeout: float | None = None,
+    ) -> DshReply:
+        """Wait for the turn that started after ``baseline`` to finish."""
+        return await self._await_reply(session, session_id, baseline, timeout=timeout)
+
     async def _wait_idle(self, session: aiohttp.ClientSession, session_id: str) -> None:
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
@@ -723,8 +750,9 @@ class DshHttpClient:
         session: aiohttp.ClientSession,
         session_id: str,
         baseline: int,
+        timeout: float | None = None,
     ) -> DshReply:
-        deadline = time.monotonic() + self.timeout
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         last_reply = DshReply()
         while time.monotonic() < deadline:
             cursor = await self.cursor(session, session_id)

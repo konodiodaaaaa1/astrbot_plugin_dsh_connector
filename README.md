@@ -71,6 +71,9 @@ dsh web --port 3080
 /dsh <任务>
 /dsh steer <补充指令>
 /dsh stop
+/dsh approve
+/dsh deny
+/dsh approvals
 /dsh sessions
 /dsh session switch <sessionId>
 /dsh session search <关键词>
@@ -142,6 +145,16 @@ dsh web --port 3080
 ## 实时回复
 
 HTTP/auto 模式等待 DSH turn 完成后，将最终文本、卡片和图片组件组成消息链发送。普通长度回复保持一条消息；超过 QQ 单条消息限制时按换行边界有序切片。卡片、DSH attachment 与其他图片仍会在任务完成后继续发送。
+
+单个 turn 超过 `command_timeout`（默认 600 秒）时，插件不再直接放弃：它会把「仍在后台执行」的提示发给聊天，并继续在后台监视该会话，turn 结束（或失败）后把最终结果主动发到原聊天。监视上限由 `completion_watch_timeout` 控制（默认 6 小时），可以用 `/dsh stop` 取消 turn。
+
+## 授权请求
+
+DSH 的 `approval/request` 不是 HTTP RPC，而是经 `/api/remote.mux` WebSocket 下发的 waterfall。插件用 `route_approvals` 开关（默认开启）在后台维持这条事件桥；收到属于某个聊天所绑定会话的授权请求时，会把工具名、原因和会话 ID 发到该聊天，等待 `/dsh approve`（允许一次）或 `/dsh deny`（拒绝），再通过 `$events/result` 把结论送回 DSH。等待期间 turn 保持挂起，授权完成后继续执行；DSH 界面里取消请求时聊天也会收到失效提示。从 DSH Web 界面直接创建的会话没有聊天绑定，仍由界面自己的授权弹窗处理。
+
+## 长任务与进程重启
+
+插件在 `initialize()` 时建立事件桥，DSH 侧断线会退避重连；DSH 会把尚未回答的授权请求重新投递给新连接，因此插件重载后仍能补齐待授权提示。会话到聊天的反向索引保存在 AstrBot KV 中，重启 AstrBot 不会丢失授权路由。
 
 ## LLM 工具
 
