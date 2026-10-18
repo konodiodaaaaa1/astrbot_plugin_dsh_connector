@@ -39,10 +39,12 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
 try:
     from .dsh_connector_helpers import DshReply, merge_replies, model_rows
+    from .core.approval_bridge import DshEventBridge
     from .core.dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout, normalize_client_time_zone
     from .core.config_service import compact_json, dotted_path, format_namespaces, namespace_map, parse_json_value, read_path
     from .core.presentation import current_goal, projection_values, session_label
@@ -53,6 +55,7 @@ try:
     from .core.reply_render import normalize_reply_render_mode, should_render_card, split_markdown_for_cards, split_text_for_message
 except ImportError:  # AstrBot also supports loading a plugin main.py as a module.
     from dsh_connector_helpers import DshReply, merge_replies, model_rows
+    from core.approval_bridge import DshEventBridge
     from core.dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout, normalize_client_time_zone
     from core.config_service import compact_json, dotted_path, format_namespaces, namespace_map, parse_json_value, read_path
     from core.presentation import current_goal, projection_values, session_label
@@ -81,6 +84,9 @@ HELP_TEXT = """【DeepSeek Harness Connector】
   /dsh queue <remove|steer|edit> <消息ID> [文本]
   /dsh steer <指令>  插入当前执行中的任务
   /dsh stop      取消当前会话正在执行的任务
+  /dsh approve   允许当前 DSH 授权请求（工具调用）
+  /dsh deny      拒绝当前 DSH 授权请求
+  /dsh approvals 查看本聊天待授权的 DSH 请求
   /dsh history [条数]  查看当前会话最近记录
   /dsh reset     重置当前聊天绑定的 DSH 会话
   /dsh settings  查看 DSH 主机设置命名空间
@@ -100,6 +106,16 @@ class Main(Star):
         # 会话映射缓存：chat_key -> DSH session_id（HTTP 多轮模式使用）
         self._state = SessionState()
         self._temp_media: set[Path] = set()
+        self._pending_approvals: dict[str, dict] = {}
+        self._approval_tasks: set[asyncio.Task] = set()
+        self._completion_tasks: set[asyncio.Task] = set()
+        self._bridge: DshEventBridge | None = None
+        self._bridge_http: aiohttp.ClientSession | None = None
+        self._bridge_task: asyncio.Task | None = None
+
+    async def initialize(self) -> None:
+        """Start the DSH event bridge so approvals reach the bound chat."""
+        await self._ensure_event_bridge()
 
     # ---------------- 配置便捷方法 ----------------
 
@@ -119,7 +135,118 @@ class Main(Star):
         base_url = str(self._cfg("http_base_url", "http://127.0.0.1:3080"))
         timeout = float(self._cfg("command_timeout", 600))
         poll_interval = float(self._cfg("poll_interval", 1.0))
-        return DshHttpClient(base_url, timeout, poll_interval)
+        return DshHttpClient(
+            base_url,
+            timeout,
+            poll_interval,
+            dsh_home=str(self._cfg("dsh_home", "") or ""),
+            default_cwd=str(self._cfg("default_cwd", "") or ""),
+        )
+
+    # ---------------- DSH 事件桥（授权请求） ----------------
+
+    async def _ensure_event_bridge(self) -> None:
+        if self.mode == "headless" or not bool(self._cfg("route_approvals", True)):
+            return
+        if self._bridge_task is not None and not self._bridge_task.done():
+            return
+        if self._bridge_http is None or self._bridge_http.closed:
+            self._bridge_http = aiohttp.ClientSession()
+        client = self._make_http_client()
+        self._bridge = DshEventBridge(client, self._bridge_http, self._on_remote_event, logger)
+        self._bridge_task = self._bridge.start()
+
+    async def _on_remote_event(self, frame: dict) -> None:
+        kind = frame.get("type")
+        if kind == "waterfall" and frame.get("event") == "approval/request":
+            task = asyncio.create_task(self._handle_approval(frame))
+            self._approval_tasks.add(task)
+            task.add_done_callback(self._approval_tasks.discard)
+            return
+        if kind == "cancel":
+            event_id = str(frame.get("eventId") or "")
+            record = self._pending_approvals.pop(event_id, None)
+            if record is not None and not record["decision"].done():
+                record["decision"].set_result(None)
+                await self._send_text(
+                    record["chat_key"],
+                    "刚才的 DSH 授权请求已失效（可能已在 DSH 界面处理，或任务已取消）。",
+                )
+
+    async def _handle_approval(self, frame: dict) -> None:
+        event_id = str(frame.get("eventId") or "")
+        agent_id = str(frame.get("agentId") or "")
+        request = frame.get("request") if isinstance(frame.get("request"), dict) else {}
+        if not event_id or not agent_id or event_id in self._pending_approvals:
+            return
+        chat_key = await self._state.owner_of(self, agent_id)
+        if not chat_key:
+            # Sessions started in the DSH GUI are answered by its own approval UI.
+            logger.info("DSH 授权请求 %s 未绑定聊天（session=%s）", event_id, agent_id)
+            return
+        tool = str(request.get("toolName") or "工具")
+        reason = str(request.get("reason") or "").strip()
+        display = request.get("displayReason")
+        if isinstance(display, dict):
+            reason = str(display.get("zh-CN") or display.get("zh") or display.get("en") or reason)
+        record = {
+            "event_id": event_id,
+            "chat_key": chat_key,
+            "agent_id": agent_id,
+            "tool": tool,
+            "reason": reason,
+            "decision": asyncio.get_running_loop().create_future(),
+        }
+        self._pending_approvals[event_id] = record
+        lines = ["⚠️ DSH 请求授权", f"工具：{tool}"]
+        if reason:
+            lines.append(f"原因：{reason}")
+        lines.append(f"会话：{agent_id}")
+        lines.append("回复 /dsh approve 允许一次，或 /dsh deny 拒绝。")
+        await self._send_text(chat_key, "\n".join(lines))
+        try:
+            decision = await record["decision"]
+        finally:
+            self._pending_approvals.pop(event_id, None)
+        if decision is None or self._bridge is None:
+            return
+        try:
+            await self._bridge.answer(event_id, str(decision))
+        except DshError as exc:
+            await self._send_text(chat_key, f"⚠️ 授权结果未能送回 DSH：{exc}")
+
+    async def _resolve_approval(self, chat_key: str, decision: str) -> str:
+        record = next(
+            (
+                row for row in self._pending_approvals.values()
+                if row.get("chat_key") == chat_key and not row["decision"].done()
+            ),
+            None,
+        )
+        if record is None:
+            return "当前没有等待授权的 DSH 请求。"
+        record["decision"].set_result(decision)
+        return "已允许本次工具调用。" if decision == "allowed-once" else "已拒绝本次工具调用。"
+
+    def _approvals_text(self, chat_key: str) -> str:
+        rows = [row for row in self._pending_approvals.values() if row.get("chat_key") == chat_key]
+        if not rows:
+            return "当前没有等待授权的 DSH 请求。"
+        return "\n".join(["【待授权】"] + [
+            f"- {row['tool']} @ {row['agent_id']}\n  {row['reason'] or '无原因说明'}"
+            for row in rows
+        ])
+
+    async def _send_text(self, chat_key: str, text: str) -> None:
+        await self._send_message(chat_key, [Plain(text)])
+
+    async def _send_message(self, chat_key: str, chain: list) -> None:
+        try:
+            sent = await self.context.send_message(chat_key, MessageChain(chain))
+            if not sent:
+                logger.warning("DSH 主动消息未被平台接受：%s", chat_key)
+        except Exception as exc:
+            logger.warning("DSH 主动消息发送失败：%s", exc)
 
     # ---------------- 会话映射（尽力持久化） ----------------
 
@@ -133,6 +260,7 @@ class Main(Star):
     async def _save_session_id(self, chat_key: str, session_id: str) -> None:
         try:
             await self._state.save_session(self, chat_key, session_id)
+            await self._state.remember_owner(self, session_id, chat_key)
         except Exception as exc:
             logger.warning(f"保存 DSH 会话映射失败：{exc}")
 
@@ -206,16 +334,50 @@ class Main(Star):
         prompt_mode: str = "queue",
     ) -> DshReply:
         client = self._make_http_client()
+        chat_key = await self._chat_key(event)
         async with aiohttp.ClientSession() as http_session:
             session_id = await self._session_for_chat(event, client, http_session)
             options = await self._load_session_options(event)
-            return await client.run_prompt(
+            if prompt_mode == "queue":
+                await client.wait_idle(http_session, session_id)
+            baseline = await client.cursor(http_session, session_id)
+            await client.prompt(
                 http_session,
                 session_id,
                 text,
                 mode=prompt_mode,
                 client_time_zone=options["client_time_zone"],
             )
+            try:
+                return await client.await_turn(http_session, session_id, baseline)
+            except DshTimeout as exc:
+                # The turn keeps running in DSH; keep watching and push the
+                # result into this chat when it eventually finishes.
+                self._start_completion_watcher(chat_key, session_id, baseline)
+                raise DshTimeout(
+                    "DSH 仍在后台执行，完成后会把结果主动发到本聊天；"
+                    "也可以用 /dsh stop 取消。"
+                ) from exc
+
+    def _start_completion_watcher(self, chat_key: str, session_id: str, baseline: int) -> None:
+        task = asyncio.create_task(self._watch_completion(chat_key, session_id, baseline))
+        self._completion_tasks.add(task)
+        task.add_done_callback(self._completion_tasks.discard)
+
+    async def _watch_completion(self, chat_key: str, session_id: str, baseline: int) -> None:
+        timeout = float(self._cfg("completion_watch_timeout", 6 * 3600) or 6 * 3600)
+        client = self._make_http_client()
+        async with aiohttp.ClientSession() as http_session:
+            try:
+                reply = await client.await_turn(http_session, session_id, baseline, timeout=timeout)
+            except DshError as exc:
+                await self._send_text(chat_key, f"❌ DSH 后台任务读取失败：{exc}")
+                return
+            chain = await self._reply_chain(reply)
+        if not chain:
+            await self._send_text(chat_key, "（DSH 任务已完成，但没有可呈现的内容）")
+            return
+        await self._send_message(chat_key, chain)
 
     async def _run_headless(self, text: str) -> DshReply:
         profile = str(self._cfg("dsh_profile", "headless") or "headless").strip()
@@ -409,6 +571,15 @@ class Main(Star):
         if lowered in ("help", "帮助", "usage", "-h", "--help", "?", "？"):
             yield event.plain_result(HELP_TEXT)
             return
+        if lowered in ("approve", "allow", "允许", "批准"):
+            yield event.plain_result(await self._resolve_approval(await self._chat_key(event), "allowed-once"))
+            return
+        if lowered in ("deny", "reject", "拒绝"):
+            yield event.plain_result(await self._resolve_approval(await self._chat_key(event), "rejected"))
+            return
+        if lowered in ("approvals", "pending", "待授权", "授权"):
+            yield event.plain_result(self._approvals_text(await self._chat_key(event)))
+            return
         if lowered in ("status", "状态", "ping"):
             yield event.plain_result(await self._status_text())
             return
@@ -522,6 +693,11 @@ class Main(Star):
                     f"(version {info.get('version', '?')})"
                 )
                 lines.append(f"工作目录：{info.get('cwd', '?')}")
+                connected = bool(self._bridge and self._bridge.connected)
+                lines.append(
+                    f"事件桥：{'已连接' if connected else '未连接'}；"
+                    f"待授权请求：{len(self._pending_approvals)}"
+                )
             except DshError as exc:
                 lines.append(f"❌ HTTP 连接失败：{exc}")
         if self.mode in ("headless", "auto"):
@@ -561,7 +737,10 @@ class Main(Star):
             values = projection_values(row)
             goal = values.get("goal") or {}
             goal_phase = ((goal.get("goal") or {}).get("phase")) if isinstance(goal, dict) else None
-            lines.append(f"{index}. {session_label(row)}\n   cwd={row.get('cwd', '?')} preset={row.get('agentPreset', '?')} goal={goal_phase or '-'}")
+            lines.append(
+                f"{index}. {session_label(row)}\n"
+                f"   cwd={row.get('cwd', '?')} preset={values.get('agentPreset', '?')} goal={goal_phase or '-'}"
+            )
         return "\n".join(lines)
 
     async def _history_text(self, event: AstrMessageEvent, command: str) -> str:
@@ -687,7 +866,7 @@ class Main(Star):
                 async with aiohttp.ClientSession() as http_session:
                     value = await client.presets(http_session)
                 return "\n".join(["【DSH Agent Presets]"] + [
-                    f"- {row.get('id')} trust={row.get('trust')} default={row.get('isDefault')} {row.get('name', '')} {row.get('description', '')}"
+                    f"- {row.get('id')} default={row.get('isDefault')} order={row.get('order')}"
                     for row in value.get("presets") or []
                 ])
             if action == "read":
@@ -1035,7 +1214,9 @@ class Main(Star):
             providers = value.get("providers") or []
             lines = ["【DSH LLM 服务商】"]
             lines.extend(
-                f"- {row.get('provider')} ({row.get('displayName')}) active={row.get('active')} setting={row.get('settingsNs')}.{'.'.join(row.get('settingsPath') or [])}"
+                f"- {row.get('provider')} ({row.get('displayName')}) "
+                f"declared={row.get('declared', True)} "
+                f"setting={row.get('settingsNs')}.{'.'.join(row.get('settingsPath') or [])}"
                 for row in providers
             )
             return "\n".join(lines)
@@ -1422,6 +1603,22 @@ class Main(Star):
 
     async def terminate(self):
         """插件卸载/禁用时调用。"""
+        for task in list(self._approval_tasks) + list(self._completion_tasks):
+            task.cancel()
+        if self._approval_tasks or self._completion_tasks:
+            await asyncio.gather(
+                *self._approval_tasks, *self._completion_tasks, return_exceptions=True
+            )
+        self._approval_tasks.clear()
+        self._completion_tasks.clear()
+        self._pending_approvals.clear()
+        if self._bridge is not None:
+            await self._bridge.close()
+            self._bridge = None
+        if self._bridge_http is not None:
+            await self._bridge_http.close()
+            self._bridge_http = None
+        self._bridge_task = None
         self._state.session_cache.clear()
         for path in self._temp_media:
             try:

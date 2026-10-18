@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.1.1 - 2026-10-18
+
+- 新增 DSH 授权请求桥：通过 `/api/remote.mux` 的 `$events` 流接收 `approval/request`，在绑定的聊天里提示，并用 `/dsh approve`、`/dsh deny` 经 `$events/result` 回送结论。
+- 新增会话到聊天的反向索引（AstrBot KV），授权请求能路由回原聊天；DSH 界面取消的请求会同步提示。
+- 修复长任务完成不唤醒的问题：`command_timeout` 到期后不再放弃，后台继续监视 turn，完成时主动把结果发到聊天；`completion_watch_timeout` 控制监视上限。
+- 新增 `/dsh approvals` 与状态里的「事件桥 / 待授权」信息。
+- 事件桥断线自动重连；插件重载后 DSH 会重新投递未回答的授权请求。
+
+## 2.1.0 - 2026-10-18
+
+- 适配 DSH 0.2.0-rc.2：RPC 端点从点号方法切换到 Typert 的 `<namespace>/<method>`，payload 统一为 `{"args": {...}}`。
+- 新增 DSH 浏览器会话认证：从 `$DSH_HOME/.credentials.yaml` 的 `client-connection/browser-session` 密钥本地签发 `dsh-auth-*` cookie，无需手动复制启动 token，DSH 重启后仍然可用。
+- `session/history` 改为 `session/projections` 取游标 + `session/page` 翻页，回复轮询不再依赖已删除的历史接口。
+- `session/prompt` 补充客户端 `requestId`；`commands/execute` 补充 `submittedAttachments`。
+- 新增 `dsh_home`、`default_cwd` 配置项；`host.describe` 删除后由 settings 与本机 DSH 状态合成主机描述。
+- 模型目录改用 `session/modelCatalog`，服务商改用 `llm/listConfigurableProviders`，权限预设改用 `permissionPresets/catalog`。
+- Presets、Skills、Goals、Subagents、Workspaces 迁移到新命名空间；子代理列表改由父会话的 `session/list` 推导，工作区列表读取 DSH 的 `storages/workspace.json`。
+- 补齐 401/403/404 的可读错误提示，便于定位凭据、Host 校验与版本不匹配问题。
+
 ## 2.0.1 - 2026-08-18
 
 - 删除实时增量与文本分片发送，完整 DSH 回复统一作为一条消息链发送，避免 QQ 端按句子产生多条消息。

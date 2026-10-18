@@ -1,6 +1,6 @@
 # AstrBot DSH Connector
 
-面向 DeepSeek Harness Web Host 的 AstrBot 连接器。每个 AstrBot 聊天窗口拥有独立的 DSH 会话绑定和创建选项，任务结果以文本、图片及 DSH 原生 attachment 形式回传。
+面向 DeepSeek Harness（DSH 0.2+）Web Host 的 AstrBot 连接器。每个 AstrBot 聊天窗口拥有独立的 DSH 会话绑定和创建选项，任务结果以文本、图片及 DSH 原生 attachment 形式回传。
 
 仓库地址：<https://github.com/konodiodaaaaa1/astrbot_plugin_dsh_connector>
 
@@ -12,7 +12,15 @@
 dsh web --port 3080
 ```
 
-插件默认连接 `http://127.0.0.1:3080`。AstrBot 插件配置页负责连接地址、超时、图片限额和 LLM 工具开关。
+插件默认连接 `http://127.0.0.1:3080`。AstrBot 插件配置页负责连接地址、DSH 主目录、默认工作目录、超时、图片限额和 LLM 工具开关。
+
+## 兼容性与认证
+
+插件调用 DSH 0.2 起的 Typert RPC：端点为 `/api/<namespace>/<method>`，请求体是 `{"args": {...}}`。DSH 0.2 同时给 `/api` 加了浏览器会话认证——只有 `dsh web` 启动时打印的 `?token=` URL 能换取 `dsh-auth-*` 签名 cookie，且不接受 `Authorization` 头。插件不要求复制那个一次性 token，而是读取 DSH 持久化的签名密钥（`$DSH_HOME/.credentials.yaml` 里的 `client-connection/browser-session` 记录）在本地现签 cookie，所以 DSH 重启后无需重新配置。
+
+`dsh_home` 留空时按环境变量 `DSH_HOME`、再退回 `~/.dsh` 定位；DSH 装在别处时把它指过去即可。工作区列表也从同一目录的 `storages/workspace.json` 读取，因为 DSH 0.2 不再提供 `workspace.list`。`http` 模式要求 `http_base_url` 是回环地址（`127.0.0.1` 或 `localhost`），DSH 的 Host 校验会拒绝其它 authority；新建会话未指定目录时，依次使用配置 `default_cwd`、DSH 已登记的第一个工作区路径、用户主目录。
+
+`headless` 模式仍可单独使用（`dsh --profile headless "<指令>"`），但它每条消息都会起一个新进程，也无法复用 HTTP 模式按聊天绑定的会话，仅建议作为应急回退。
 
 ## 聊天窗口配置
 
@@ -63,6 +71,9 @@ dsh web --port 3080
 /dsh <任务>
 /dsh steer <补充指令>
 /dsh stop
+/dsh approve
+/dsh deny
+/dsh approvals
 /dsh sessions
 /dsh session switch <sessionId>
 /dsh session search <关键词>
@@ -88,9 +99,11 @@ dsh web --port 3080
 连接器直接调用 DSH RPC，可查询和控制以下域：
 
 - Settings namespace、JSON Schema、路径级 `set`/`unset`
-- LLM providers 与模型目录
+- LLM providers 与模型目录（`session/modelCatalog`、`llm/listConfigurableProviders`）
 - Agent Presets、Skills、Subagents、Goals、Workspaces
 - Session search、fork、queue、cancel 和 attachment
+
+会话历史与回复轮询走 `session/projections`（取当前 `asOfSeq` 游标）加 `session/page`（按游标翻页），不再依赖 DSH 0.2 已删除的 `session.history`。
 
 示例：
 
@@ -132,6 +145,16 @@ dsh web --port 3080
 ## 实时回复
 
 HTTP/auto 模式等待 DSH turn 完成后，将最终文本、卡片和图片组件组成消息链发送。普通长度回复保持一条消息；超过 QQ 单条消息限制时按换行边界有序切片。卡片、DSH attachment 与其他图片仍会在任务完成后继续发送。
+
+单个 turn 超过 `command_timeout`（默认 600 秒）时，插件不再直接放弃：它会把「仍在后台执行」的提示发给聊天，并继续在后台监视该会话，turn 结束（或失败）后把最终结果主动发到原聊天。监视上限由 `completion_watch_timeout` 控制（默认 6 小时），可以用 `/dsh stop` 取消 turn。
+
+## 授权请求
+
+DSH 的 `approval/request` 不是 HTTP RPC，而是经 `/api/remote.mux` WebSocket 下发的 waterfall。插件用 `route_approvals` 开关（默认开启）在后台维持这条事件桥；收到属于某个聊天所绑定会话的授权请求时，会把工具名、原因和会话 ID 发到该聊天，等待 `/dsh approve`（允许一次）或 `/dsh deny`（拒绝），再通过 `$events/result` 把结论送回 DSH。等待期间 turn 保持挂起，授权完成后继续执行；DSH 界面里取消请求时聊天也会收到失效提示。从 DSH Web 界面直接创建的会话没有聊天绑定，仍由界面自己的授权弹窗处理。
+
+## 长任务与进程重启
+
+插件在 `initialize()` 时建立事件桥，DSH 侧断线会退避重连；DSH 会把尚未回答的授权请求重新投递给新连接，因此插件重载后仍能补齐待授权提示。会话到聊天的反向索引保存在 AstrBot KV 中，重启 AstrBot 不会丢失授权路由。
 
 ## LLM 工具
 

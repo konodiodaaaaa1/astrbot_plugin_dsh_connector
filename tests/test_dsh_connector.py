@@ -1,11 +1,26 @@
+import asyncio
+import base64
+import hashlib
+import hmac
+import json
+import logging
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core.approval_bridge import DshEventBridge
 from core.config_service import dotted_path, namespace_map, parse_json_value, read_path
-from core.dsh_client import DshHttpClient, normalize_client_time_zone
+from core.dsh_client import (
+    DshError,
+    DshHttpClient,
+    DshTimeout,
+    build_auth_cookie,
+    extract_browser_session_secret,
+    normalize_client_time_zone,
+)
 from core.session_options import SessionSetupWizard, format_session_options, normalize_session_options
 from core.session_state import SessionState
 from core.reply_render import should_render_card, split_markdown_for_cards, split_text_for_message
@@ -28,6 +43,8 @@ class DshConnectorHelperTests(unittest.TestCase):
 
         self.assertIn("/dsh help", HELP_TEXT)
         self.assertIn("/dsh session delete [id]", HELP_TEXT)
+        self.assertIn("/dsh approve", HELP_TEXT)
+        self.assertIn("/dsh deny", HELP_TEXT)
 
     def test_assistant_reply_keeps_text_and_distinct_images(self):
         reply = assistant_reply({
@@ -192,17 +209,28 @@ class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
                 return Response(self.request)
 
         client = DshHttpClient("http://example.test", 1, 0.1)
+        client._secret = b"unit-test-secret-0123456789abcd"
         session = Session()
         result = await client.execute_command(session, "session-a", "/permission read-only")
         self.assertEqual(session.url, "http://example.test/api/commands/execute")
         self.assertEqual(session.request["method"], "commands/execute")
         self.assertEqual(session.request["payload"], {
-            "args": {"agentId": "session-a", "line": "/permission read-only"},
+            "args": {
+                "agentId": "session-a",
+                "line": "/permission read-only",
+                "submittedAttachments": [],
+            },
         })
         self.assertEqual(result["result"]["text"], "preset read-only")
 
     async def test_permission_presets_are_read_from_live_schema_shape(self):
         class SettingsClient(DshHttpClient):
+            def __init__(self):
+                super().__init__("http://example.test", 1, 0)
+
+            async def rpc(self, _session, method, args=None):
+                raise DshError("permission catalog unavailable")
+
             async def settings(self, _session):
                 return {"namespaces": [{
                     "ns": "permission",
@@ -217,28 +245,28 @@ class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
                     },
                 }]}
 
-        client = SettingsClient("http://example.test", 1, 0.1)
+        client = SettingsClient()
         self.assertEqual(await client.permission_presets(None), ["sandboxed", "trusted"])
 
     async def test_create_session_prefers_workspace_id(self):
         client = CaptureClient()
         await client.create_session(None, cwd="D:/ignored", workspace_id="workspace-live")
         self.assertEqual(client.calls, [(
-            "session.create",
-            {"workspaceId": "workspace-live"},
+            "session/create",
+            {"request": {"workspaceId": "workspace-live"}},
         )])
 
     async def test_archive_session_uses_dsh_workspace_api(self):
         client = CaptureClient()
         await client.archive_session(None, "session-a")
-        self.assertEqual(client.calls, [("workspace.archiveSession", {"sessionId": "session-a"})])
+        self.assertEqual(client.calls, [(
+            "workspace/archiveSession",
+            {"request": {"sessionId": "session-a"}},
+        )])
 
-    async def test_history_waits_for_final_message_after_text_deltas(self):
-        chunk_one = {"event": {"seq": 1, "type": "assistant/chunk", "data": {
-            "chunk": {"type": "text-delta", "text": "hel"},
-        }}}
-        chunk_two = {"event": {"seq": 2, "type": "assistant/chunk", "data": {
-            "chunk": {"type": "text-delta", "text": "lo"},
+    async def test_await_reply_waits_for_turn_end_after_intermediate_messages(self):
+        partial = {"event": {"seq": 1, "type": "assistant/message", "data": {
+            "message": {"content": [{"type": "text", "text": "hel"}]},
         }}}
         message = {"event": {"seq": 3, "type": "assistant/message", "data": {
             "message": {"content": [{"type": "text", "text": "hello"}]},
@@ -252,14 +280,19 @@ class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
                 super().__init__("http://example.test", 1, 0)
                 self.round = 0
 
-            async def history(self, _session, _session_id, max_messages=100):
-                self.round += 1
-                return [chunk_one] if self.round == 1 else [chunk_one, chunk_two, message, end]
+            async def cursor(self, _session, _session_id):
+                return 2 if self.round == 0 else 4
+
+            async def page(self, _session, _session_id, through_seq, max_messages=100, before_seq=None):
+                if self.round == 0:
+                    self.round = 1
+                    return {"records": [partial]}
+                return {"records": [partial, message, end]}
 
         reply = await StreamingClient()._await_reply(None, "session-a", 0)
         self.assertEqual(reply.text, "hello")
 
-    async def test_history_returns_only_last_assistant_message_from_multi_step_turn(self):
+    async def test_await_reply_returns_only_last_assistant_message_from_multi_step_turn(self):
         step_one = {"event": {"seq": 1, "type": "assistant/message", "data": {
             "turn": 1,
             "step": 1,
@@ -278,11 +311,12 @@ class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
         class MultiStepClient(DshHttpClient):
             def __init__(self):
                 super().__init__("http://example.test", 1, 0)
-                self.round = 0
 
-            async def history(self, _session, _session_id, max_messages=100):
-                self.round += 1
-                return [step_one] if self.round == 1 else [step_one, step_two, end]
+            async def cursor(self, _session, _session_id):
+                return 3
+
+            async def page(self, _session, _session_id, through_seq, max_messages=100, before_seq=None):
+                return {"records": [step_one, step_two, end]}
 
         reply = await MultiStepClient()._await_reply(None, "session-a", 0)
         self.assertEqual(reply.text, "final answer")
@@ -290,13 +324,16 @@ class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
     async def test_prompt_uses_dsh_compatible_iana_time_zone(self):
         client = CaptureClient()
         await client.prompt(None, "session-a", "hello", client_time_zone="Asia/Shanghai")
-        payload = client.calls[0][1]
+        payload = client.calls[0][1]["request"]
         self.assertEqual(payload["clientTimeZone"], "Asia/Shanghai")
+        self.assertEqual(payload["sessionId"], "session-a")
+        self.assertEqual(payload["mode"], "queue")
+        self.assertTrue(payload["requestId"])
 
     async def test_settings_mutation_uses_revision_and_path_operation(self):
         client = CaptureClient()
         await client.mutate_settings(None, "llm-deepseek", [{"op": "set", "path": ["maxTokens"], "value": 4096}], 7)
-        self.assertEqual(client.calls, [("settings.mutate", {
+        self.assertEqual(client.calls, [("settings/mutate", {
             "ns": "llm-deepseek",
             "ops": [{"op": "set", "path": ["maxTokens"], "value": 4096}],
             "expectedRevision": 7,
@@ -306,20 +343,22 @@ class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
         client = CaptureClient()
         await client.update_queue(None, "session-a", "message-a", "edit", "revised")
         await client.goal_action(None, "pause", "session-a", {"id": "goal-a", "revision": 2})
-        self.assertEqual(client.calls[0], ("session.updateQueue", {
-            "sessionId": "session-a",
-            "itemId": "message-a",
-            "action": {"kind": "edit", "content": [{"type": "text", "text": "revised"}]},
+        self.assertEqual(client.calls[0], ("session/updateQueue", {
+            "request": {
+                "sessionId": "session-a",
+                "itemId": "message-a",
+                "action": {"kind": "edit", "content": [{"type": "text", "text": "revised"}]},
+            },
         }))
-        self.assertEqual(client.calls[1], ("goal.pause", {
-            "sessionId": "session-a", "ref": {"id": "goal-a", "revision": 2},
+        self.assertEqual(client.calls[1], ("goals/pause", {
+            "agentId": "session-a", "ref": {"id": "goal-a", "revision": 2},
         }))
 
     async def test_attachment_payload_uses_owning_session(self):
         client = CaptureClient()
         await client.attachment(None, "session-a", "sha256:abc")
-        self.assertEqual(client.calls, [("session.attachment", {
-            "sessionId": "session-a", "attachmentId": "sha256:abc",
+        self.assertEqual(client.calls, [("session/attachment", {
+            "request": {"sessionId": "session-a", "attachmentId": "sha256:abc"},
         })])
 
     async def test_native_attachment_resolves_to_renderable_data_url(self):
@@ -334,6 +373,342 @@ class DshClientPayloadTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(reply.image_sources, ["data:image/png;base64,AA=="])
         self.assertEqual(client.calls, [("session-a", "sha256:abc")])
+
+    def test_credentials_secret_is_read_without_yaml_dependency(self):
+        secret = bytes(range(32))
+        encoded = base64.b64encode(secret).decode().replace("+", "-").replace("/", "_").rstrip("=")
+        text = (
+            "version: 1\n"
+            "refs:\n"
+            "  DEEPSEEK_API_KEY: value\n"
+            "records:\n"
+            "  client-connection/browser-session:\n"
+            "    kind: grant\n"
+            "    payload:\n"
+            "      version: 1\n"
+            f"      secret: {encoded}\n"
+        )
+        self.assertEqual(extract_browser_session_secret(text), secret)
+        self.assertIsNone(extract_browser_session_secret("records: {}\n"))
+
+    async def test_rpc_signs_the_browser_session_cookie_for_its_authority(self):
+        secret = bytes(range(32))
+
+        class Response:
+            status = 200
+
+            def __init__(self, request):
+                self.request = request
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def json(self):
+                return {
+                    "type": "server-response",
+                    "rpcId": self.request["rpcId"],
+                    "result": {"ok": True, "value": {"items": []}},
+                }
+
+            async def text(self):
+                return ""
+
+        class Session:
+            def __init__(self):
+                self.headers = None
+
+            def post(self, url, **kwargs):
+                self.headers = kwargs["headers"]
+                return Response(kwargs["json"])
+
+        client = DshHttpClient("http://127.0.0.1:3080", 1, 0.1)
+        client._secret = secret
+        session = Session()
+        await client.rpc(session, "session/list", {"_request": {}})
+
+        self.assertEqual(session.headers["content-type"], "application/json")
+        name, _, value = session.headers["cookie"].partition("=")
+        expected_name = "dsh-auth-" + base64.b64encode(
+            hashlib.sha256(b"127.0.0.1:3080").digest()
+        ).decode().replace("+", "-").replace("/", "_").rstrip("=")
+        self.assertEqual(name, expected_name)
+
+        version, body, signature = value.split(".")
+        self.assertEqual(version, "v1")
+        payload = json.loads(base64.urlsafe_b64decode(body + "=" * ((4 - len(body) % 4) % 4)))
+        self.assertEqual(payload["authority"], "127.0.0.1:3080")
+        self.assertLess(payload["issuedAt"], payload["expiresAt"])
+        expected_signature = base64.b64encode(
+            hmac.new(secret, body.encode("ascii"), hashlib.sha256).digest()
+        ).decode().replace("+", "-").replace("/", "_").rstrip("=")
+        self.assertEqual(signature, expected_signature)
+
+    async def test_missing_credentials_raise_an_actionable_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = DshHttpClient("http://127.0.0.1:3080", 1, 0.1, dsh_home=directory)
+            with self.assertRaises(DshError) as caught:
+                await client.list_sessions(None)
+        self.assertIn(".credentials.yaml", str(caught.exception))
+
+    async def test_history_value_reads_page_through_the_projection_cursor(self):
+        class PageClient(DshHttpClient):
+            def __init__(self):
+                super().__init__("http://example.test", 1, 0)
+                self.pages = []
+
+            async def projections(self, _session, _session_id):
+                return {"asOfSeq": 42, "values": {"goal": {"goal": {"id": "goal-a", "revision": 2}}}}
+
+            async def page(self, _session, session_id, through_seq, max_messages=100, before_seq=None):
+                self.pages.append((session_id, through_seq, max_messages))
+                return {
+                    "records": [{"event": {"seq": 43, "type": "assistant/message", "data": {}}}],
+                    "hasMore": False,
+                }
+
+        client = PageClient()
+        value = await client.history_value(None, "session-a", 30)
+        self.assertEqual(client.pages, [("session-a", 42, 30)])
+        self.assertEqual(value["cursor"], 42)
+        self.assertEqual(len(value["events"]), 1)
+        self.assertIn("goal", value["projections"]["values"])
+
+    async def test_permission_presets_prefer_the_catalog_endpoint(self):
+        class CatalogClient(DshHttpClient):
+            def __init__(self):
+                super().__init__("http://example.test", 1, 0)
+                self.calls = []
+
+            async def rpc(self, _session, method, args=None):
+                self.calls.append((method, args))
+                return {"options": [{"value": "read-only"}, {"value": "workspace-write"}]}
+
+        client = CatalogClient()
+        self.assertEqual(await client.permission_presets(None), ["read-only", "workspace-write"])
+        self.assertEqual(client.calls, [("permissionPresets/catalog", {})])
+
+
+class DshApprovalBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bridge_dispatches_approval_and_answers_via_event_result(self):
+        seen = []
+        answers = []
+
+        class Client:
+            def auth_cookie(self):
+                return "dsh-auth-test=value"
+
+            def websocket_url(self, path):
+                return "ws://example.test" + path
+
+            async def rpc(self, _session, method, args=None):
+                answers.append((method, args))
+                return None
+
+        async def on_frame(frame):
+            seen.append(frame)
+
+        bridge = DshEventBridge(Client(), object(), on_frame, logging.getLogger("dsh-connector-test"))
+        bridge._receive(json.dumps({"type": "item", "value": {"type": "ready", "clientId": "client-a"}}))
+        bridge._receive(json.dumps({"type": "item", "value": {
+            "type": "waterfall",
+            "event": "approval/request",
+            "eventId": "event-a",
+            "agentId": "session-a",
+            "request": {"toolName": "pwsh"},
+        }}))
+        await asyncio.sleep(0)
+
+        self.assertEqual(bridge.client_id, "client-a")
+        self.assertTrue(bridge.connected)
+        self.assertEqual(seen[0]["eventId"], "event-a")
+
+        await bridge.answer("event-a", "allowed-once")
+        self.assertEqual(answers, [("$events/result", {
+            "clientId": "client-a",
+            "eventId": "event-a",
+            "outcome": {"kind": "result", "value": "allowed-once"},
+        })])
+
+    async def test_bridge_refuses_to_answer_before_its_ready_frame(self):
+        class Client:
+            def auth_cookie(self):
+                return ""
+
+            def websocket_url(self, path):
+                return "ws://example.test" + path
+
+            async def rpc(self, *_args, **_kwargs):
+                raise AssertionError("must not post before ready")
+
+        bridge = DshEventBridge(Client(), object(), lambda _frame: None, logging.getLogger("test"))
+        with self.assertRaises(DshError):
+            await bridge.answer("event-a", "rejected")
+
+
+class DshApprovalRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_approval_is_forwarded_to_the_bound_chat_and_answered(self):
+        from main import Main
+        from core.session_state import SessionState
+
+        plugin = object.__new__(Main)
+        plugin.config = {"route_approvals": True}
+        plugin._state = SessionState()
+        plugin._state.owners_cache = {"session-a": "chat-a"}
+        plugin._pending_approvals = {}
+        plugin._approval_tasks = set()
+        sent = []
+        answered = []
+
+        async def send_text(chat_key, text):
+            sent.append((chat_key, text))
+
+        plugin._send_text = send_text
+
+        class Bridge:
+            async def answer(self, event_id, outcome):
+                answered.append((event_id, outcome))
+
+        plugin._bridge = Bridge()
+        frame = {
+            "type": "waterfall",
+            "event": "approval/request",
+            "eventId": "event-a",
+            "agentId": "session-a",
+            "request": {"toolName": "pwsh", "reason": "需要写入工作区外文件"},
+        }
+        task = asyncio.create_task(plugin._handle_approval(frame))
+        await asyncio.sleep(0)
+
+        self.assertEqual(sent[0][0], "chat-a")
+        self.assertIn("DSH 请求授权", sent[0][1])
+        self.assertIn("pwsh", sent[0][1])
+        self.assertEqual(
+            await plugin._resolve_approval("chat-a", "allowed-once"),
+            "已允许本次工具调用。",
+        )
+        await task
+        self.assertEqual(answered, [("event-a", "allowed-once")])
+
+    async def test_approval_without_a_bound_chat_is_left_to_the_dsh_gui(self):
+        from main import Main
+        from core.session_state import SessionState
+
+        plugin = object.__new__(Main)
+        plugin.config = {"route_approvals": True}
+        plugin._state = SessionState()
+        plugin._state.owners_cache = {}
+        plugin._pending_approvals = {}
+        sent = []
+
+        async def send_text(chat_key, text):
+            sent.append((chat_key, text))
+
+        plugin._send_text = send_text
+        frame = {
+            "type": "waterfall",
+            "event": "approval/request",
+            "eventId": "event-b",
+            "agentId": "session-gui",
+            "request": {"toolName": "pwsh"},
+        }
+        await plugin._handle_approval(frame)
+        self.assertEqual(sent, [])
+        self.assertEqual(plugin._pending_approvals, {})
+
+
+class DshCompletionWatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_watcher_pushes_a_finished_turn_to_the_chat(self):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = {
+            "completion_watch_timeout": 60,
+            "reply_render_mode": "text",
+            "max_reply_chars": 0,
+            "max_images_per_reply": 0,
+        }
+        sent = []
+
+        async def send_message(chat_key, chain):
+            sent.append((chat_key, [part.text for part in chain]))
+
+        plugin._send_message = send_message
+
+        class Client:
+            async def await_turn(self, _session, session_id, baseline, timeout=None):
+                return DshReply(text="后台完成")
+
+        plugin._make_http_client = lambda: Client()
+        await plugin._watch_completion("chat-a", "session-a", 0)
+        self.assertEqual(sent, [("chat-a", ["后台完成"])])
+
+    async def test_timed_out_turn_starts_a_background_watcher(self):
+        from main import Main
+        from core.session_options import normalize_session_options
+
+        plugin = object.__new__(Main)
+        plugin.config = {
+            "command_timeout": 1,
+            "poll_interval": 0.05,
+            "reply_render_mode": "text",
+            "max_reply_chars": 0,
+            "max_images_per_reply": 0,
+            "completion_watch_timeout": 60,
+        }
+        plugin._state = SessionState()
+        plugin._state.session_cache["chat-a"] = "session-a"
+        plugin._state.options_cache["chat-a"] = normalize_session_options({})
+        plugin._completion_tasks = set()
+        clients = []
+        sent = []
+
+        class Client:
+            def __init__(self, fail):
+                self.fail = fail
+
+            async def wait_idle(self, *_args):
+                return None
+
+            async def cursor(self, *_args):
+                return 5
+
+            async def prompt(self, *_args, **_kwargs):
+                return {"accepted": True}
+
+            async def await_turn(self, _session, session_id, baseline, timeout=None):
+                if self.fail:
+                    raise DshTimeout("等待超时")
+                return DshReply(text="后台结果")
+
+        def make_client():
+            client = Client(fail=not clients)
+            clients.append(client)
+            return client
+
+        async def send_message(chat_key, chain):
+            sent.append((chat_key, [part.text for part in chain]))
+
+        plugin._make_http_client = make_client
+        plugin._send_message = send_message
+
+        class Event:
+            unified_msg_origin = "chat-a"
+
+            def get_sender_id(self):
+                return "1"
+
+        with self.assertRaises(DshTimeout) as caught:
+            await plugin._run_http(Event(), "long task")
+        self.assertIn("后台", str(caught.exception))
+
+        for _ in range(100):
+            if sent:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(sent, [("chat-a", ["后台结果"])])
 
 
 class DshSessionStateTests(unittest.IsolatedAsyncioTestCase):
@@ -375,6 +750,29 @@ class DshSessionStateTests(unittest.IsolatedAsyncioTestCase):
         await state.update_options(plugin, "chat-b", {"working_directory": "D:/B"})
         self.assertEqual((await state.load_options(plugin, "chat-a"))["working_directory"], "D:/A")
         self.assertEqual((await state.load_options(plugin, "chat-b"))["working_directory"], "D:/B")
+
+    async def test_session_owner_index_routes_events_back_to_the_chat(self):
+        class Plugin:
+            def __init__(self):
+                self.store = {}
+
+            async def get_kv_data(self, key, default):
+                return self.store.get(key, default)
+
+            async def put_kv_data(self, key, value):
+                self.store[key] = value
+
+            async def delete_kv_data(self, key):
+                self.store.pop(key, None)
+
+        plugin = Plugin()
+        state = SessionState()
+        await state.remember_owner(plugin, "session-a", "chat-a")
+        self.assertEqual(await state.owner_of(plugin, "session-a"), "chat-a")
+        self.assertEqual(await SessionState().owner_of(plugin, "session-a"), "chat-a")
+
+        await state.forget_owner(plugin, "session-a")
+        self.assertIsNone(await SessionState().owner_of(plugin, "session-a"))
 
 
 class DshConnectorImageTests(unittest.IsolatedAsyncioTestCase):
