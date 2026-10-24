@@ -4,16 +4,21 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core import app_host
+from core.app_host import discover_app_base_url, reset_app_host_cache
 from core.approval_bridge import DshEventBridge
 from core.config_service import dotted_path, namespace_map, parse_json_value, read_path
 from core.dsh_client import (
+    DshConnectionError,
     DshError,
     DshHttpClient,
     DshTimeout,
@@ -641,7 +646,7 @@ class DshCompletionWatcherTests(unittest.IsolatedAsyncioTestCase):
             async def await_turn(self, _session, session_id, baseline, timeout=None):
                 return DshReply(text="后台完成")
 
-        plugin._make_http_client = lambda: Client()
+        plugin._make_http_client = lambda *_args, **_kwargs: Client()
         await plugin._watch_completion("chat-a", "session-a", 0)
         self.assertEqual(sent, [("chat-a", ["后台完成"])])
 
@@ -683,7 +688,7 @@ class DshCompletionWatcherTests(unittest.IsolatedAsyncioTestCase):
                     raise DshTimeout("等待超时")
                 return DshReply(text="后台结果")
 
-        def make_client():
+        def make_client(*_args, **_kwargs):
             client = Client(fail=not clients)
             clients.append(client)
             return client
@@ -932,6 +937,271 @@ class DshConnectorImageTests(unittest.IsolatedAsyncioTestCase):
         request = type("Request", (), {"func_tool": FunctionTools()})()
         await plugin.on_llm_request(None, request)
         self.assertEqual(request.func_tool.removed, ["dsh_connector_set_dsh_setting"])
+
+
+class DshDesktopAppDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        reset_app_host_cache()
+
+    def tearDown(self):
+        reset_app_host_cache()
+
+    def test_process_matching_accepts_desktop_host_and_app_executable(self):
+        self.assertTrue(app_host._is_dsh_desktop_host(
+            "electron.exe",
+            "C:/electron.exe",
+            "electron app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/index.js",
+        ))
+        self.assertTrue(app_host._is_dsh_desktop_host(
+            "DeepSeek Harness.exe",
+            "D:/deepseek harness/app/DeepSeek Harness.exe",
+            "",
+        ))
+        self.assertFalse(app_host._is_dsh_desktop_host(
+            "node.exe",
+            "C:/node/node.exe",
+            "node dsh web --port 3080",
+        ))
+        self.assertFalse(app_host._is_dsh_desktop_host(
+            "DeepSeek Harness.exe",
+            "D:/deepseek harness/app/DeepSeek Harness.exe",
+            "app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js web --port 3080",
+        ))
+
+    def test_discovery_returns_loopback_base_url_of_desktop_host(self):
+        identities = {
+            42: ("DeepSeek Harness.exe", "D:/deepseek harness/app/DeepSeek Harness.exe", "dsh-desktop-host/lib/index.js"),
+            7: ("node.exe", "C:/node/node.exe", "dsh web --port 3080"),
+        }
+        with mock.patch.object(app_host, "_listening_loopback_ports", return_value={42: [10404], 7: [3080]}), \
+                mock.patch.object(app_host, "_process_identity", side_effect=identities.get):
+            self.assertEqual(discover_app_base_url(), "http://127.0.0.1:10404")
+
+    def test_discovery_ignores_web_host_and_reports_actionable_error(self):
+        identity = ("node.exe", "C:/node/node.exe", "dsh web --port 3080")
+        with mock.patch.object(app_host, "_listening_loopback_ports", return_value={7: [3080]}), \
+                mock.patch.object(app_host, "_process_identity", return_value=identity):
+            with self.assertRaises(DshError) as caught:
+                discover_app_base_url()
+        self.assertIn("桌面应用", str(caught.exception))
+        self.assertIn("app_base_url", str(caught.exception))
+
+    def test_discovery_chooses_lowest_candidate_port(self):
+        identities = {
+            42: ("DeepSeek Harness.exe", "DeepSeek Harness.exe", "dsh-desktop-host"),
+            43: ("DeepSeek Harness.exe", "DeepSeek Harness.exe", "dsh-desktop-host"),
+        }
+        with mock.patch.object(app_host, "_listening_loopback_ports", return_value={42: [10405], 43: [10404]}), \
+                mock.patch.object(app_host, "_process_identity", side_effect=identities.get):
+            self.assertEqual(discover_app_base_url(), "http://127.0.0.1:10404")
+
+    def test_discovery_caches_success_until_forced(self):
+        calls = []
+
+        def listening_ports():
+            calls.append(1)
+            return {42: [10404]}
+
+        identity = ("DeepSeek Harness.exe", "DeepSeek Harness.exe", "dsh-desktop-host")
+        with mock.patch.object(app_host, "_listening_loopback_ports", side_effect=listening_ports), \
+                mock.patch.object(app_host, "_process_identity", return_value=identity):
+            discover_app_base_url()
+            discover_app_base_url()
+            self.assertEqual(len(calls), 1)
+            discover_app_base_url(force=True)
+            self.assertEqual(len(calls), 2)
+
+    def test_discovery_reports_missing_psutil(self):
+        with mock.patch.object(app_host, "psutil", None):
+            with self.assertRaises(DshError) as caught:
+                discover_app_base_url(force=True)
+        self.assertIn("psutil", str(caught.exception))
+
+
+class DshAppEntryModeTests(unittest.TestCase):
+    def _plugin(self, **config):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = config
+        plugin._active_entry = ""
+        return plugin
+
+    def test_app_mode_prefers_configured_app_base_url(self):
+        plugin = self._plugin(mode="app", app_base_url="http://127.0.0.1:1234/")
+        self.assertEqual(plugin._http_base_url(), "http://127.0.0.1:1234")
+        self.assertEqual(plugin._make_http_client().base_url, "http://127.0.0.1:1234")
+
+    def test_app_mode_discovers_entry_when_url_is_blank(self):
+        plugin = self._plugin(mode="app")
+        with mock.patch("main.discover_app_base_url", return_value="http://127.0.0.1:10404"):
+            self.assertEqual(plugin._http_base_url("app"), "http://127.0.0.1:10404")
+            self.assertEqual(plugin._make_http_client("app").base_url, "http://127.0.0.1:10404")
+
+    def test_http_mode_keeps_web_base_url(self):
+        plugin = self._plugin(mode="http", http_base_url="http://127.0.0.1:3080/")
+        self.assertEqual(plugin._http_base_url(), "http://127.0.0.1:3080")
+
+    def test_unknown_mode_falls_back_to_web_entry(self):
+        plugin = self._plugin(mode="desktop")
+        self.assertEqual(plugin.mode, "http")
+
+    def test_app_mode_rejects_url_without_scheme(self):
+        plugin = self._plugin(mode="app", app_base_url="127.0.0.1:10404")
+        with self.assertRaises(DshError) as caught:
+            plugin._http_base_url()
+        self.assertIn("app_base_url", str(caught.exception))
+
+
+class DshAppEntryStatusTests(unittest.IsolatedAsyncioTestCase):
+    def _plugin(self, **config):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = config
+        plugin._active_entry = ""
+        plugin._pending_approvals = {}
+        plugin._bridge = None
+        return plugin
+
+    async def test_status_shows_discovered_app_entry(self):
+        plugin = self._plugin(mode="app")
+
+        class Client:
+            async def describe(self, _session):
+                return {
+                    "provider": "deepseek-official",
+                    "model": "deepseek-flash",
+                    "version": "0.2.1",
+                    "cwd": "D:/AI/workspace",
+                }
+
+        plugin._make_http_client = lambda *_args, **_kwargs: Client()
+        with mock.patch("main.discover_app_base_url", return_value="http://127.0.0.1:10404"):
+            text = await plugin._status_text()
+        self.assertIn("App 入口：http://127.0.0.1:10404（自动发现）", text)
+        self.assertIn("✅", text)
+
+    async def test_status_reports_missing_app_entry_without_raising(self):
+        plugin = self._plugin(mode="app")
+        with mock.patch(
+            "main.discover_app_base_url",
+            side_effect=DshError("未发现正在运行的 DeepSeek Harness 桌面应用。"),
+        ):
+            text = await plugin._status_text()
+        self.assertIn("❌", text)
+        self.assertIn("桌面应用", text)
+
+
+class DshAppEntryRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auto_mode_tries_app_entry_before_headless(self):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = {"mode": "auto"}
+        plugin._active_entry = ""
+        calls = []
+
+        async def fake_run_http(event, text, prompt_mode="queue", entry=""):
+            calls.append(entry)
+            if entry == "http":
+                raise DshConnectionError("web down")
+            return DshReply(text="来自桌面应用")
+
+        async def fail_headless(_text):
+            raise AssertionError("headless must not run when the app entry works")
+
+        plugin._run_http = fake_run_http
+        plugin._run_headless = fail_headless
+        plugin._http_base_url = lambda entry="": "http://127.0.0.1:10404"
+        reply = await plugin._run(object(), "hi")
+        self.assertEqual(reply.text, "来自桌面应用")
+        self.assertEqual(calls, ["http", "app"])
+
+    async def test_auto_mode_falls_back_to_headless_when_app_is_missing(self):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = {"mode": "auto"}
+        plugin._active_entry = ""
+        calls = []
+
+        async def fake_run_http(event, text, prompt_mode="queue", entry=""):
+            calls.append(entry)
+            raise DshConnectionError("web down")
+
+        async def fake_headless(_text):
+            return DshReply(text="来自命令行")
+
+        def fake_base_url(entry=""):
+            if entry == "app":
+                raise DshError("未发现正在运行的 DeepSeek Harness 桌面应用。")
+            return "http://127.0.0.1:3080"
+
+        plugin._run_http = fake_run_http
+        plugin._run_headless = fake_headless
+        plugin._http_base_url = fake_base_url
+        reply = await plugin._run(object(), "hi")
+        self.assertEqual(reply.text, "来自命令行")
+        self.assertEqual(calls, ["http"])
+
+    async def test_app_mode_connection_error_mentions_desktop_app(self):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = {"mode": "app"}
+        plugin._active_entry = ""
+        calls = []
+
+        async def fake_run_http(event, text, prompt_mode="queue", entry=""):
+            calls.append(entry)
+            raise DshConnectionError("连接 DeepSeek Harness 失败（http://127.0.0.1:10404）")
+
+        plugin._run_http = fake_run_http
+        plugin._http_base_url = lambda entry="": "http://127.0.0.1:10404"
+        with self.assertRaises(DshError) as caught:
+            await plugin._run(object(), "hi")
+        self.assertEqual(calls, ["app"])
+        self.assertIn("桌面应用", str(caught.exception))
+
+
+class DshApprovalBridgeClientFactoryTests(unittest.TestCase):
+    def test_bridge_refreshes_client_before_connecting(self):
+        refreshed = []
+
+        class Client:
+            def __init__(self, name):
+                self.name = name
+
+        def factory():
+            client = Client(f"client-{len(refreshed)}")
+            refreshed.append(client)
+            return client
+
+        bridge = DshEventBridge(
+            Client("initial"),
+            object(),
+            lambda _frame: None,
+            logging.getLogger("test"),
+            client_factory=factory,
+        )
+        self.assertIs(bridge._refresh_client(), refreshed[0])
+        self.assertIs(bridge.client, refreshed[0])
+
+
+@unittest.skipUnless(
+    os.environ.get("DSH_CONNECTOR_LIVE_APP") == "1",
+    "set DSH_CONNECTOR_LIVE_APP=1 to probe the running DSH desktop app",
+)
+class DshDesktopAppLiveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_desktop_app_answers_an_authenticated_rpc(self):
+        import aiohttp
+
+        base_url = discover_app_base_url(force=True)
+        client = DshHttpClient(base_url, 10, 0.5)
+        async with aiohttp.ClientSession() as http_session:
+            value = await client.rpc(http_session, "settings/describe", {})
+        self.assertIn("namespaces", value)
 
 
 if __name__ == "__main__":

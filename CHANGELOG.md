@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.2.0 - 2026-10-24
+
+- 新增 `app` 连接入口：直接连接本机正在运行的 DeepSeek Harness 桌面应用，与 `http` 的 Web Host 入口平级。桌面应用的 Web Host 绑定 `127.0.0.1` 的随机端口且不落盘，插件通过本机进程表（`dsh-desktop-host` 命令行特征）自动发现端口。
+- 新增 `app_base_url` 配置：自动发现失败、应用不在默认位置或需要手动指定时使用；`app` 入口复用现有的浏览器会话凭据、Typert RPC、图片与 Markdown 卡片链路。
+- `auto` 模式改为依次尝试 `http`、`app`，都不可用时回退 `headless`；`/dsh status` 与 `/dsh settings` 会显示当前入口地址。
+- 授权事件桥支持按入口重建，并在每次重连前刷新 base URL：桌面应用重启换了端口后，授权转发无需重启 AstrBot 即可自愈。
+- 新增 App 入口的单元测试、桌面应用 live 测试（`DSH_CONNECTOR_LIVE_APP=1` 时运行）与 README 说明。
+
 ## 2.1.1 - 2026-10-18
 
 - 新增 DSH 授权请求桥：通过 `/api/remote.mux` 的 `$events` 流接收 `approval/request`，在绑定的聊天里提示，并用 `/dsh approve`、`/dsh deny` 经 `$events/result` 回送结论。

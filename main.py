@@ -8,9 +8,10 @@
 
 支持的连接方式（在插件配置面板中选择 ``mode``）：
 
-* ``http``     —— 连接运行中的 DSH Web HTTP API（默认 http://127.0.0.1:3080）
+* ``http``     —— 连接运行中的 DSH Web Host（``dsh web``，默认 http://127.0.0.1:3080）
+* ``app``      —— 连接本机正在运行的 DeepSeek Harness 桌面应用（自动发现回环端口）
 * ``headless`` —— 通过 DSH 命令行 ``dsh --profile headless "<指令>"`` 一次性执行
-* ``auto``     —— 优先使用 http，连接失败时自动回退到 headless
+* ``auto``     —— 依次尝试 http、app，连接失败时回退到 headless
 
 指令示例：:
 
@@ -44,6 +45,7 @@ from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
 try:
     from .dsh_connector_helpers import DshReply, merge_replies, model_rows
+    from .core.app_host import discover_app_base_url
     from .core.approval_bridge import DshEventBridge
     from .core.dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout, normalize_client_time_zone
     from .core.config_service import compact_json, dotted_path, format_namespaces, namespace_map, parse_json_value, read_path
@@ -55,6 +57,7 @@ try:
     from .core.reply_render import normalize_reply_render_mode, should_render_card, split_markdown_for_cards, split_text_for_message
 except ImportError:  # AstrBot also supports loading a plugin main.py as a module.
     from dsh_connector_helpers import DshReply, merge_replies, model_rows
+    from core.app_host import discover_app_base_url
     from core.approval_bridge import DshEventBridge
     from core.dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout, normalize_client_time_zone
     from core.config_service import compact_json, dotted_path, format_namespaces, namespace_map, parse_json_value, read_path
@@ -112,6 +115,8 @@ class Main(Star):
         self._bridge: DshEventBridge | None = None
         self._bridge_http: aiohttp.ClientSession | None = None
         self._bridge_task: asyncio.Task | None = None
+        self._bridge_entry = ""
+        self._active_entry = ""
 
     async def initialize(self) -> None:
         """Start the DSH event bridge so approvals reach the bound chat."""
@@ -125,14 +130,51 @@ class Main(Star):
 
     @property
     def mode(self) -> str:
-        return str(self._cfg("mode", "http")).lower()
+        mode = str(self._cfg("mode", "http")).strip().lower()
+        return mode if mode in {"http", "app", "headless", "auto"} else "http"
 
     @property
     def dsh_command(self) -> str:
         return str(self._cfg("dsh_command", "dsh") or "dsh").strip()
 
-    def _make_http_client(self) -> DshHttpClient:
-        base_url = str(self._cfg("http_base_url", "http://127.0.0.1:3080"))
+    def _resolve_entry(self, entry: str = "") -> str:
+        """Return the transport entry: "http" for the Web Host, "app" for the app."""
+        if entry in {"http", "app"}:
+            return entry
+        if self.mode == "app":
+            return "app"
+        if self.mode == "auto" and getattr(self, "_active_entry", "") == "app":
+            return "app"
+        return "http"
+
+    def _app_base_url(self) -> str:
+        """Resolve the desktop application's base URL from config or discovery."""
+        configured = str(self._cfg("app_base_url", "") or "").strip()
+        if configured:
+            if not configured.lower().startswith(("http://", "https://")):
+                raise DshError(
+                    "app_base_url 需要是 http(s) 地址，例如 http://127.0.0.1:10404。"
+                )
+            return configured.rstrip("/")
+        return discover_app_base_url()
+
+    def _http_base_url(self, entry: str = "") -> str:
+        """Return the base URL of the selected DSH entry."""
+        if self._resolve_entry(entry) == "app":
+            return self._app_base_url()
+        return str(self._cfg("http_base_url", "http://127.0.0.1:3080")).strip().rstrip("/")
+
+    def _app_entry_description(self) -> str:
+        """Describe the app entry for diagnostics without raising."""
+        configured = str(self._cfg("app_base_url", "") or "").strip()
+        try:
+            base_url = self._app_base_url()
+        except DshError:
+            return "未发现正在运行的桌面应用"
+        return base_url if configured else f"{base_url}（自动发现）"
+
+    def _make_http_client(self, entry: str = "") -> DshHttpClient:
+        base_url = self._http_base_url(entry)
         timeout = float(self._cfg("command_timeout", 600))
         poll_interval = float(self._cfg("poll_interval", 1.0))
         return DshHttpClient(
@@ -145,16 +187,39 @@ class Main(Star):
 
     # ---------------- DSH 事件桥（授权请求） ----------------
 
-    async def _ensure_event_bridge(self) -> None:
+    async def _ensure_event_bridge(self, entry: str = "") -> None:
+        """Start or retarget the approval bridge for one transport entry."""
         if self.mode == "headless" or not bool(self._cfg("route_approvals", True)):
             return
+        target = self._resolve_entry(entry)
         if self._bridge_task is not None and not self._bridge_task.done():
+            if getattr(self, "_bridge_entry", "") == target:
+                return
+            await self._close_event_bridge()
+        try:
+            client = self._make_http_client(target)
+        except DshError as exc:
+            logger.warning("DSH 授权事件桥暂未启动：%s", exc)
             return
         if self._bridge_http is None or self._bridge_http.closed:
             self._bridge_http = aiohttp.ClientSession()
-        client = self._make_http_client()
-        self._bridge = DshEventBridge(client, self._bridge_http, self._on_remote_event, logger)
+        self._bridge = DshEventBridge(
+            client,
+            self._bridge_http,
+            self._on_remote_event,
+            logger,
+            client_factory=lambda: self._make_http_client(target),
+        )
+        self._bridge_entry = target
         self._bridge_task = self._bridge.start()
+
+    async def _close_event_bridge(self) -> None:
+        """Stop the approval bridge while keeping its HTTP session reusable."""
+        if self._bridge is not None:
+            await self._bridge.close()
+            self._bridge = None
+        self._bridge_task = None
+        self._bridge_entry = ""
 
     async def _on_remote_event(self, frame: dict) -> None:
         kind = frame.get("type")
@@ -332,8 +397,14 @@ class Main(Star):
         event: AstrMessageEvent,
         text: str,
         prompt_mode: str = "queue",
+        entry: str = "",
     ) -> DshReply:
-        client = self._make_http_client()
+        actual = self._resolve_entry(entry)
+        if actual == "app":
+            # The app may start after the plugin loaded; warm the bridge lazily.
+            await self._ensure_event_bridge(actual)
+        client = self._make_http_client(actual)
+        self._active_entry = actual
         chat_key = await self._chat_key(event)
         async with aiohttp.ClientSession() as http_session:
             session_id = await self._session_for_chat(event, client, http_session)
@@ -366,7 +437,8 @@ class Main(Star):
 
     async def _watch_completion(self, chat_key: str, session_id: str, baseline: int) -> None:
         timeout = float(self._cfg("completion_watch_timeout", 6 * 3600) or 6 * 3600)
-        client = self._make_http_client()
+        entry = str(getattr(self, "_active_entry", "") or "")
+        client = self._make_http_client(entry) if entry else self._make_http_client()
         async with aiohttp.ClientSession() as http_session:
             try:
                 reply = await client.await_turn(http_session, session_id, baseline, timeout=timeout)
@@ -436,13 +508,27 @@ class Main(Star):
         mode = self.mode
         if mode == "headless":
             return await self._run_headless(text)
+        if mode == "app":
+            try:
+                return await self._run_http(event, text, prompt_mode=prompt_mode, entry="app")
+            except DshConnectionError as exc:
+                raise DshError(f"{exc}；请确认 DeepSeek Harness 桌面应用正在运行。") from exc
         try:
-            return await self._run_http(event, text, prompt_mode=prompt_mode)
+            return await self._run_http(event, text, prompt_mode=prompt_mode, entry="http")
         except DshConnectionError:
-            if mode == "auto":
-                logger.info("HTTP 连接失败，回退到 headless 模式执行")
+            if mode != "auto":
+                raise
+            try:
+                self._http_base_url("app")
+            except DshError as exc:
+                logger.info("App 入口不可用（%s），回退到 headless 模式执行", exc)
                 return await self._run_headless(text)
-            raise
+            logger.info("Web 入口连接失败，尝试 DSH 桌面应用入口")
+            try:
+                return await self._run_http(event, text, prompt_mode=prompt_mode, entry="app")
+            except DshConnectionError:
+                logger.info("App 入口连接失败，回退到 headless 模式执行")
+                return await self._run_headless(text)
 
     async def _download_image(self, source: str) -> str | None:
         """Return a local image path suitable for AstrBot's ``Image`` component."""
@@ -683,9 +769,16 @@ class Main(Star):
 
     async def _status_text(self) -> str:
         lines = ["【DeepSeek Harness 桥接状态】", f"模式：{self.mode}"]
-        if self.mode in ("http", "auto"):
-            client = self._make_http_client()
+        if self.mode in ("http", "app", "auto"):
             try:
+                entry = self._resolve_entry()
+                base_url = self._http_base_url(entry)
+                client = self._make_http_client(entry)
+                if entry == "app":
+                    configured = str(self._cfg("app_base_url", "") or "").strip()
+                    lines.append(f"App 入口：{base_url}" + ("" if configured else "（自动发现）"))
+                else:
+                    lines.append(f"Web 入口：{base_url}")
                 async with aiohttp.ClientSession() as http_session:
                     info = await client.describe(http_session)
                 lines.append(
@@ -707,7 +800,7 @@ class Main(Star):
 
     async def _require_http(self) -> None:
         if self.mode == "headless":
-            raise DshError("该操作需要 DSH Web HTTP 模式。请将 mode 设置为 http 或 auto。")
+            raise DshError("该操作需要 HTTP 连接。请将 mode 设置为 http、app 或 auto。")
 
     async def _active_http_session(self, event: AstrMessageEvent):
         await self._require_http()
@@ -907,7 +1000,8 @@ class Main(Star):
         return "\n".join([
             "【DSH Connector】",
             f"mode={self.mode}",
-            f"http_base_url={self._cfg('http_base_url', 'http://127.0.0.1:3080')}",
+            f"web 入口：{self._cfg('http_base_url', 'http://127.0.0.1:3080')}",
+            f"app 入口：{self._app_entry_description()}",
             f"图片：max_images_per_reply={self._cfg('max_images_per_reply', 4)}，max_image_bytes={self._cfg('max_image_bytes', 5242880)}",
             "",
             format_session_options(options),
@@ -1612,13 +1706,11 @@ class Main(Star):
         self._approval_tasks.clear()
         self._completion_tasks.clear()
         self._pending_approvals.clear()
-        if self._bridge is not None:
-            await self._bridge.close()
-            self._bridge = None
+        await self._close_event_bridge()
         if self._bridge_http is not None:
             await self._bridge_http.close()
             self._bridge_http = None
-        self._bridge_task = None
+        self._active_entry = ""
         self._state.session_cache.clear()
         for path in self._temp_media:
             try:

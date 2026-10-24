@@ -1,12 +1,12 @@
 name: astrbot_plugin_dsh_connector
 display_name: DeepSeek Harness Connector
-short_desc: 连接 DeepSeek Harness，提供按聊天隔离的会话控制与图片输出
+short_desc: 连接 DeepSeek Harness（Web Host 或桌面应用），提供按聊天隔离的会话控制与图片输出
 desc: >-
   通过 DSH Web HTTP API 在 AstrBot 中创建、绑定和控制 DeepSeek Harness 会话。
-  兼容 DSH 0.2 起的 Typert RPC 与浏览器会话认证。
+  兼容 DSH 0.2 起的 Typert RPC 与浏览器会话认证，可连接 dsh web 或本机 DeepSeek Harness 桌面应用。
   每个聊天窗口独立保存工作空间或目录、Agent Preset、模型、推理强度、权限和 IANA 时区，
   并支持 DSH 原生 attachment 图片、Settings、Skills、Subagents、Goals 与 Workspaces。
-version: 2.1.1
+version: 2.2.0
 author: konodiodaaaaa1
 repo: https://github.com/konodiodaaaaa1/astrbot_plugin_dsh_connector
 astrbot_version: ">=4.0.0"

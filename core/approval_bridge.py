@@ -41,8 +41,10 @@ class DshEventBridge:
         logger: Any,
         reconnect_seconds: float = 2.0,
         max_reconnect_seconds: float = 30.0,
+        client_factory: Callable[[], DshHttpClient] | None = None,
     ) -> None:
         self.client = client
+        self.client_factory = client_factory
         self.http_session = http_session
         self.on_frame = on_frame
         self.logger = logger
@@ -92,9 +94,16 @@ class DshEventBridge:
             await asyncio.sleep(delay)
             delay = min(delay * 2, self.max_reconnect_seconds)
 
+    def _refresh_client(self) -> DshHttpClient:
+        """Re-resolve the transport before a reconnect (the app may have restarted)."""
+        if self.client_factory is not None:
+            self.client = self.client_factory()
+        return self.client
+
     async def _connect_once(self) -> None:
-        cookie = self.client.auth_cookie()
-        url = self.client.websocket_url(MUX_PATH)
+        client = self._refresh_client()
+        cookie = client.auth_cookie()
+        url = client.websocket_url(MUX_PATH)
         async with self.http_session.ws_connect(
             url,
             headers={"cookie": cookie},
