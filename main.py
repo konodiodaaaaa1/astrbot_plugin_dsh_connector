@@ -400,8 +400,9 @@ class Main(Star):
         entry: str = "",
     ) -> DshReply:
         actual = self._resolve_entry(entry)
-        if actual == "app":
-            # The app may start after the plugin loaded; warm the bridge lazily.
+        if actual == "app" or getattr(self, "_bridge", None) is not None:
+            # Warm the bridge when the app starts late, and retarget it when
+            # auto mode switches between the web and app entries.
             await self._ensure_event_bridge(actual)
         client = self._make_http_client(actual)
         self._active_entry = actual
