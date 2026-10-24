@@ -28,7 +28,7 @@ AstrBot 插件配置页负责连接方式、两个入口地址、DSH 主目录�
 
 桌面应用的 `app` 入口共用同一套认证：桌面应用内部同样以 `runProfile()` 拉起 Web 应用，只是绑定 `127.0.0.1` 的随机端口。插件自动发现该端口后，用同一份凭据现签 cookie，因此应用重启换了端口也能重新连上，无需重新配置。
 
-`dsh_home` 留空时按环境变量 `DSH_HOME`、再退回 `~/.dsh` 定位；DSH 装在别处时把它指过去即可。工作区列表也从同一目录的 `storages/workspace.json` 读取，因为 DSH 0.2 不再提供 `workspace.list`。`http` 与 `app` 两个入口都只接受回环地址（`app` 由插件自动发现或由 `app_base_url` 指定），DSH 的 Host 校验会拒绝其它 authority；新建会话未指定目录时，依次使用配置 `default_cwd`、DSH 已登记的第一个工作区路径、用户主目录。
+`dsh_home` 留空时按环境变量 `DSH_HOME`、再退回 `~/.dsh` 定位；DSH 装在别处时把它指过去即可。工作区列表也从同一目录的 `storages/workspace.json` 读取，因为 DSH 0.2 不再提供 `workspace.list`。两个入口的请求都要过 DSH 的 Host 校验，因此 `http` 的 `http_base_url` 需是回环地址，`app` 由插件自动发现回环端口（手动填写 `app_base_url` 时也要指向本机回环地址），DSH 会拒绝其它 authority；新建会话未指定目录时，依次使用配置 `default_cwd`、DSH 已登记的第一个工作区路径、用户主目录。
 
 `headless` 模式仍可单独使用（`dsh --profile headless "<指令>"`），但它每条消息都会起一个新进程，也无法复用 HTTP 模式按聊天绑定的会话，仅建议作为应急回退；`auto` 在两个 HTTP 入口都不可用时才会走到它。
 
@@ -154,7 +154,7 @@ AstrBot 插件配置页负责连接方式、两个入口地址、DSH 主目录�
 
 ## 实时回复
 
-HTTP/auto 模式等待 DSH turn 完成后，将最终文本、卡片和图片组件组成消息链发送。普通长度回复保持一条消息；超过 QQ 单条消息限制时按换行边界有序切片。卡片、DSH attachment 与其他图片仍会在任务完成后继续发送。
+`http`、`app`、`auto` 模式等待 DSH turn 完成后，将最终文本、卡片和图片组件组成消息链发送。普通长度回复保持一条消息；超过 QQ 单条消息限制时按换行边界有序切片。卡片、DSH attachment 与其他图片仍会在任务完成后继续发送。
 
 单个 turn 超过 `command_timeout`（默认 600 秒）时，插件不再直接放弃：它会把「仍在后台执行」的提示发给聊天，并继续在后台监视该会话，turn 结束（或失败）后把最终结果主动发到原聊天。监视上限由 `completion_watch_timeout` 控制（默认 6 小时），可以用 `/dsh stop` 取消 turn。
 

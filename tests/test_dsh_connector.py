@@ -715,6 +715,42 @@ class DshCompletionWatcherTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         self.assertEqual(sent, [("chat-a", ["后台结果"])])
 
+    async def test_watcher_reports_entry_failure_to_chat(self):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = {"completion_watch_timeout": 60}
+        plugin._active_entry = "app"
+        sent = []
+
+        async def send_text(chat_key, text):
+            sent.append((chat_key, text))
+
+        def make_client(*_args, **_kwargs):
+            raise DshError("未发现正在运行的 DeepSeek Harness 桌面应用。")
+
+        plugin._send_text = send_text
+        plugin._make_http_client = make_client
+        await plugin._watch_completion("chat-a", "session-a", 0)
+        self.assertEqual(sent[0][0], "chat-a")
+        self.assertIn("读取失败", sent[0][1])
+
+    async def test_timeout_watcher_keeps_the_entry_that_served_the_turn(self):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = {}
+        plugin._completion_tasks = set()
+        calls = []
+
+        async def fake_watch(chat_key, session_id, baseline, entry=""):
+            calls.append((chat_key, session_id, baseline, entry))
+
+        plugin._watch_completion = fake_watch
+        plugin._start_completion_watcher("chat-a", "session-a", 7, "app")
+        await asyncio.sleep(0)
+        self.assertEqual(calls, [("chat-a", "session-a", 7, "app")])
+
 
 class DshSessionStateTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_state_persists_and_reuses_chat_binding(self):
@@ -1094,29 +1130,34 @@ class DshAppEntryStatusTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DshAppEntryRoutingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_auto_mode_tries_app_entry_before_headless(self):
+    async def test_auto_mode_probes_app_entry_before_headless(self):
         from main import Main
 
         plugin = object.__new__(Main)
         plugin.config = {"mode": "auto"}
         plugin._active_entry = ""
+        probed = []
         calls = []
+
+        async def fake_probe(entry):
+            probed.append(entry)
+            if entry == "http":
+                raise DshConnectionError("web down")
 
         async def fake_run_http(event, text, prompt_mode="queue", entry=""):
             calls.append(entry)
-            if entry == "http":
-                raise DshConnectionError("web down")
             return DshReply(text="来自桌面应用")
 
         async def fail_headless(_text):
             raise AssertionError("headless must not run when the app entry works")
 
+        plugin._probe_http_entry = fake_probe
         plugin._run_http = fake_run_http
         plugin._run_headless = fail_headless
-        plugin._http_base_url = lambda entry="": "http://127.0.0.1:10404"
         reply = await plugin._run(object(), "hi")
         self.assertEqual(reply.text, "来自桌面应用")
-        self.assertEqual(calls, ["http", "app"])
+        self.assertEqual(probed, ["http", "app"])
+        self.assertEqual(calls, ["app"])
 
     async def test_auto_mode_falls_back_to_headless_when_app_is_missing(self):
         from main import Main
@@ -1124,7 +1165,12 @@ class DshAppEntryRoutingTests(unittest.IsolatedAsyncioTestCase):
         plugin = object.__new__(Main)
         plugin.config = {"mode": "auto"}
         plugin._active_entry = ""
+        probed = []
         calls = []
+
+        async def fake_probe(entry):
+            probed.append(entry)
+            raise DshConnectionError(f"{entry} down")
 
         async def fake_run_http(event, text, prompt_mode="queue", entry=""):
             calls.append(entry)
@@ -1133,16 +1179,37 @@ class DshAppEntryRoutingTests(unittest.IsolatedAsyncioTestCase):
         async def fake_headless(_text):
             return DshReply(text="来自命令行")
 
-        def fake_base_url(entry=""):
-            if entry == "app":
-                raise DshError("未发现正在运行的 DeepSeek Harness 桌面应用。")
-            return "http://127.0.0.1:3080"
-
+        plugin._probe_http_entry = fake_probe
         plugin._run_http = fake_run_http
         plugin._run_headless = fake_headless
-        plugin._http_base_url = fake_base_url
         reply = await plugin._run(object(), "hi")
         self.assertEqual(reply.text, "来自命令行")
+        self.assertEqual(probed, ["http", "app"])
+        self.assertEqual(calls, [])
+
+    async def test_auto_mode_does_not_rerun_after_mid_turn_connection_drop(self):
+        from main import Main
+
+        plugin = object.__new__(Main)
+        plugin.config = {"mode": "auto"}
+        plugin._active_entry = ""
+        calls = []
+
+        async def fake_probe(_entry):
+            return None
+
+        async def fake_run_http(event, text, prompt_mode="queue", entry=""):
+            calls.append(entry)
+            raise DshConnectionError("连接中断")
+
+        async def fail_headless(_text):
+            raise AssertionError("a submitted turn must not be re-run headless")
+
+        plugin._probe_http_entry = fake_probe
+        plugin._run_http = fake_run_http
+        plugin._run_headless = fail_headless
+        with self.assertRaises(DshConnectionError):
+            await plugin._run(object(), "hi")
         self.assertEqual(calls, ["http"])
 
     async def test_app_mode_connection_error_mentions_desktop_app(self):

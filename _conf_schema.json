@@ -1,6 +1,6 @@
 {
   "mode": {"description": "连接方式", "type": "string", "default": "http", "options": ["http", "app", "headless", "auto"], "hint": "http：连接 DSH Web Host（dsh web）；app：连接本机 DeepSeek Harness 桌面应用；headless：调用 dsh 命令行；auto：依次尝试 http、app，最后回退 headless"},
-  "http_base_url": {"description": "DSH Web Host 地址", "type": "string", "default": "http://127.0.0.1:3080", "hint": "http/auto 模式使用，对应 dsh web --port 3080 的地址；DSH 0.2 起只接受回环地址"},
+  "http_base_url": {"description": "DSH Web Host 地址", "type": "string", "default": "http://127.0.0.1:3080", "hint": "http 模式使用；auto 模式把它作为 Web 入口。对应 dsh web --port 3080 的地址；DSH 0.2 起只接受回环地址"},
   "app_base_url": {"description": "DSH 桌面应用入口地址", "type": "string", "default": "", "hint": "app 模式使用。留空时自动发现正在运行的 DeepSeek Harness 桌面应用；自动发现失败或应用不在本机默认位置时手动填写，例如 http://127.0.0.1:10404"},
   "dsh_home": {"description": "DSH 主目录（DSH_HOME）", "type": "string", "default": "", "hint": "留空则读取环境变量 DSH_HOME，再退回 ~/.dsh。插件用它本地签发浏览器会话 cookie（Web Host 与桌面应用共用），并读取工作区登记表"},
   "default_cwd": {"description": "新建会话的默认工作目录", "type": "string", "default": "", "hint": "留空则使用 DSH 已登记的第一个工作区路径，再退回用户主目录"},

@@ -45,7 +45,7 @@ from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
 try:
     from .dsh_connector_helpers import DshReply, merge_replies, model_rows
-    from .core.app_host import discover_app_base_url
+    from .core.app_host import discover_app_base_url, reset_app_host_cache
     from .core.approval_bridge import DshEventBridge
     from .core.dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout, normalize_client_time_zone
     from .core.config_service import compact_json, dotted_path, format_namespaces, namespace_map, parse_json_value, read_path
@@ -57,7 +57,7 @@ try:
     from .core.reply_render import normalize_reply_render_mode, should_render_card, split_markdown_for_cards, split_text_for_message
 except ImportError:  # AstrBot also supports loading a plugin main.py as a module.
     from dsh_connector_helpers import DshReply, merge_replies, model_rows
-    from core.app_host import discover_app_base_url
+    from core.app_host import discover_app_base_url, reset_app_host_cache
     from core.approval_bridge import DshEventBridge
     from core.dsh_client import DshConnectionError, DshError, DshHttpClient, DshTimeout, normalize_client_time_zone
     from core.config_service import compact_json, dotted_path, format_namespaces, namespace_map, parse_json_value, read_path
@@ -173,13 +173,14 @@ class Main(Star):
             return "未发现正在运行的桌面应用"
         return base_url if configured else f"{base_url}（自动发现）"
 
-    def _make_http_client(self, entry: str = "") -> DshHttpClient:
+    def _make_http_client(self, entry: str = "", timeout: float | None = None) -> DshHttpClient:
         base_url = self._http_base_url(entry)
-        timeout = float(self._cfg("command_timeout", 600))
+        if timeout is None:
+            timeout = float(self._cfg("command_timeout", 600))
         poll_interval = float(self._cfg("poll_interval", 1.0))
         return DshHttpClient(
             base_url,
-            timeout,
+            float(timeout),
             poll_interval,
             dsh_home=str(self._cfg("dsh_home", "") or ""),
             default_cwd=str(self._cfg("default_cwd", "") or ""),
@@ -425,28 +426,32 @@ class Main(Star):
             except DshTimeout as exc:
                 # The turn keeps running in DSH; keep watching and push the
                 # result into this chat when it eventually finishes.
-                self._start_completion_watcher(chat_key, session_id, baseline)
+                self._start_completion_watcher(chat_key, session_id, baseline, actual)
                 raise DshTimeout(
                     "DSH 仍在后台执行，完成后会把结果主动发到本聊天；"
                     "也可以用 /dsh stop 取消。"
                 ) from exc
 
-    def _start_completion_watcher(self, chat_key: str, session_id: str, baseline: int) -> None:
-        task = asyncio.create_task(self._watch_completion(chat_key, session_id, baseline))
+    def _start_completion_watcher(
+        self, chat_key: str, session_id: str, baseline: int, entry: str = ""
+    ) -> None:
+        task = asyncio.create_task(self._watch_completion(chat_key, session_id, baseline, entry))
         self._completion_tasks.add(task)
         task.add_done_callback(self._completion_tasks.discard)
 
-    async def _watch_completion(self, chat_key: str, session_id: str, baseline: int) -> None:
+    async def _watch_completion(
+        self, chat_key: str, session_id: str, baseline: int, entry: str = ""
+    ) -> None:
         timeout = float(self._cfg("completion_watch_timeout", 6 * 3600) or 6 * 3600)
-        entry = str(getattr(self, "_active_entry", "") or "")
-        client = self._make_http_client(entry) if entry else self._make_http_client()
-        async with aiohttp.ClientSession() as http_session:
-            try:
+        entry = str(entry or getattr(self, "_active_entry", "") or "")
+        try:
+            client = self._make_http_client(entry) if entry else self._make_http_client()
+            async with aiohttp.ClientSession() as http_session:
                 reply = await client.await_turn(http_session, session_id, baseline, timeout=timeout)
-            except DshError as exc:
-                await self._send_text(chat_key, f"❌ DSH 后台任务读取失败：{exc}")
-                return
-            chain = await self._reply_chain(reply)
+        except DshError as exc:
+            await self._send_text(chat_key, f"❌ DSH 后台任务读取失败：{exc}")
+            return
+        chain = await self._reply_chain(reply)
         if not chain:
             await self._send_text(chat_key, "（DSH 任务已完成，但没有可呈现的内容）")
             return
@@ -505,6 +510,13 @@ class Main(Star):
             ) from last_err
         raise DshError(f"启动 dsh 失败：{last_err}") from last_err
 
+    async def _probe_http_entry(self, entry: str) -> None:
+        """Prove one HTTP entry answers before a turn is committed to it."""
+        timeout = min(float(self._cfg("command_timeout", 600)), 15.0)
+        client = self._make_http_client(entry, timeout=timeout)
+        async with aiohttp.ClientSession() as http_session:
+            await client.describe(http_session)
+
     async def _run(self, event: AstrMessageEvent, text: str, prompt_mode: str = "queue") -> DshReply:
         mode = self.mode
         if mode == "headless":
@@ -513,23 +525,25 @@ class Main(Star):
             try:
                 return await self._run_http(event, text, prompt_mode=prompt_mode, entry="app")
             except DshConnectionError as exc:
+                reset_app_host_cache()
                 raise DshError(f"{exc}；请确认 DeepSeek Harness 桌面应用正在运行。") from exc
-        try:
-            return await self._run_http(event, text, prompt_mode=prompt_mode, entry="http")
-        except DshConnectionError:
-            if mode != "auto":
-                raise
+        entry = "http"
+        if mode == "auto":
+            # Pick a reachable entry before sending the prompt. A connection drop
+            # after the prompt is submitted must surface as an error: retrying on
+            # another entry would execute the same instruction twice.
             try:
-                self._http_base_url("app")
-            except DshError as exc:
-                logger.info("App 入口不可用（%s），回退到 headless 模式执行", exc)
-                return await self._run_headless(text)
-            logger.info("Web 入口连接失败，尝试 DSH 桌面应用入口")
-            try:
-                return await self._run_http(event, text, prompt_mode=prompt_mode, entry="app")
-            except DshConnectionError:
-                logger.info("App 入口连接失败，回退到 headless 模式执行")
-                return await self._run_headless(text)
+                await self._probe_http_entry("http")
+            except DshConnectionError as exc:
+                logger.info("Web 入口不可用（%s），尝试 DSH 桌面应用入口", exc)
+                try:
+                    await self._probe_http_entry("app")
+                except DshError as app_exc:
+                    reset_app_host_cache()
+                    logger.info("App 入口不可用（%s），回退到 headless 模式执行", app_exc)
+                    return await self._run_headless(text)
+                entry = "app"
+        return await self._run_http(event, text, prompt_mode=prompt_mode, entry=entry)
 
     async def _download_image(self, source: str) -> str | None:
         """Return a local image path suitable for AstrBot's ``Image`` component."""
@@ -793,7 +807,7 @@ class Main(Star):
                     f"待授权请求：{len(self._pending_approvals)}"
                 )
             except DshError as exc:
-                lines.append(f"❌ HTTP 连接失败：{exc}")
+                lines.append(f"❌ 连接失败：{exc}")
         if self.mode in ("headless", "auto"):
             profile = str(self._cfg("dsh_profile", "headless") or "headless").strip()
             lines.append(f"命令行：{self.dsh_command} --profile {profile}")
